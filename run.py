@@ -6,6 +6,8 @@ from random import randint
 
 import websockets
 
+import strategy
+
 SERVER_URI = "wss://server.codechallenge.net.ar/ws?token={}"
 
 # A running text log of events received / actions sent per game, written to
@@ -95,12 +97,11 @@ async def process_your_turn(websocket, request_data):
 
 async def process_move(websocket, request_data):
     board = request_data['data']['board']
-    columns = board.find('|', 1) - 1
     print(board)
     move = {
         'game_id': request_data['data']['game_id'],
         'turn_token': request_data['data']['turn_token'],
-        'col': randint(0, columns),
+        'col': strategy.choose_column(board, request_data['data'].get('side')),
     }
     log_action(move['game_id'], {'action': 'move', 'data': move})
     await send(websocket, 'move', move)

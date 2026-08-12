@@ -53,7 +53,10 @@ class InTempDirTestCase(HistoryTestCase):
         self.addCleanup(os.chdir, cwd)
 
 
-def your_turn(game_id='g1', board='|.....|', turn_token='tok'):
+EMPTY_BOARD = '\n'.join(['.......'] * 6)
+
+
+def your_turn(game_id='g1', board=EMPTY_BOARD, turn_token='tok', side='A'):
     return json.dumps(
         {
             'event': 'your_turn',
@@ -61,7 +64,7 @@ def your_turn(game_id='g1', board='|.....|', turn_token='tok'):
                 'game_id': game_id,
                 'board': board,
                 'turn_token': turn_token,
-                'side': 'X',
+                'side': side,
             },
         }
     )
@@ -119,15 +122,23 @@ class TestSend(unittest.TestCase):
 
 
 class TestProcessMove(HistoryTestCase):
-    def test_column_is_bounded_by_the_board_width(self):
+    def test_the_column_comes_from_the_strategy(self):
         ws = FakeWebSocket()
-        request = json.loads(your_turn(board='|.......|'))
+        request = json.loads(your_turn(side='A'))
 
-        with mock.patch('run.randint', return_value=0) as randint:
+        with mock.patch('run.strategy.choose_column', return_value=5) as pick:
             asyncio.run(run.process_move(ws, request))
 
-        randint.assert_called_once_with(0, 7)
-        self.assertEqual(ws.sent[0]['data']['col'], 0)
+        pick.assert_called_once_with(EMPTY_BOARD, 'A')
+        self.assertEqual(ws.sent[0]['data']['col'], 5)
+
+    def test_it_opens_in_the_center_for_real(self):
+        """Sin mocks: el bot ya no juega al azar."""
+        ws = FakeWebSocket()
+
+        asyncio.run(run.process_move(ws, json.loads(your_turn())))
+
+        self.assertEqual(ws.sent[0]['data']['col'], 3)
 
     def test_move_carries_the_turn_token(self):
         ws = FakeWebSocket()
