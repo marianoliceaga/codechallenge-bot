@@ -1,0 +1,39 @@
+https://github.com/thecodechallenge/codechallenge-test-client/blob/main/.github/workflows/tests.yml
+eso es GH Action para correr los unittets
+
+miren:
+https://codechallenge.net.ar/
+
+https://server.codechallenge.net.ar/
+
+hemos cambiado la URL del sitio del CodeChallenge a 
+https://codechallenge.net.ar 
+
+y del server (donde se tienen que conectar el websocket)
+https://server.codechallenge.net.ar
+en el código:
+uri = "wss://server.codechallenge.net.ar/ws?token={}".format(auth_token)
+
+----------------------------------------------------------------------------------------
+1) Revisar los cambios de URLs
+hemos cambiado la URL del sitio del CodeChallenge a
+https://codechallenge.net.ar
+
+y del server (donde se tienen que conectar el websocket)
+https://server.codechallenge.net.a
+
+----------------------------------------------------------------------------------------
+2) Integración Continua y Test Coverage
+Repasar como hacer la IC en github con python: https://github.com/thecodechallenge/codechallenge-test-client
+https://github.com/thecodechallenge/codechallenge-test-client/blob/main/.github/workflows/tests.yml
+
+Coverage
+Revisar como correr el coverage en sus proyectos (https://coverage.readthedocs.io/)
+pip install coverage
+coverage run -m unittest
+coverage report
+
+3) Hacer un torneo online.
+https://codechallenge.net.ar: -> Create Tournament: elegis los jugadores…. y el Crear arranca el torneo
+https://codechallenge.net.ar/create_tournament/
+https://codechallenge.net.ar/tournaments_history/

@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# coverage
+.coverage
+.coverage.*
+htmlcov/
+
+# game logs produced by the bot
+game_*.log
+
+# secrets: never commit your auth token
+.env
+token.txt
+
+.idea/
+.vscode/

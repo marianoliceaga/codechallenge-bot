@@ -1,0 +1,13 @@
+[run]
+source = .
+omit =
+    test_*.py
+    .venv/*
+
+[report]
+show_missing = True
+skip_covered = False
+fail_under = 90
+exclude_lines =
+    pragma: no cover
+    if __name__ == .__main__.:
