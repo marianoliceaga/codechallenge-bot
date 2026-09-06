@@ -1,3 +1,4 @@
+import random
 import unittest
 
 import strategy
@@ -5,6 +6,11 @@ import strategy
 
 def board(*rows):
     return '\n'.join(rows)
+
+
+def render(grid):
+    """La grilla de vuelta al formato en que la manda el server."""
+    return board(*[''.join(row) for row in grid])
 
 
 EMPTY_BOARD = board(*['.......'] * 6)
@@ -278,6 +284,272 @@ class TestPlaysAWholeGame(unittest.TestCase):
             rendered = '\n'.join(''.join(r) for r in grid)
 
         self.fail('la partida no termino en una victoria del motor')
+
+
+class TestBitboards(unittest.TestCase):
+    """El motor busca sobre bitboards, pero tiene que ver lo mismo que la
+    version simple sobre la grilla."""
+
+    def test_the_grid_survives_the_round_trip(self):
+        grid = strategy.parse_board(
+            board('.......', '.......', '.......', '...B...', '...A...',
+                  '..BAA..')
+        )
+        position, mask, geo = strategy._to_bitboards(grid, 'A')
+
+        # 3 fichas de A, 2 de B, y nada suelto en la fila centinela.
+        self.assertEqual(position.bit_count(), 3)
+        self.assertEqual((position ^ mask).bit_count(), 2)
+        self.assertEqual(mask & ~geo.board, 0)
+
+    def test_anything_that_is_not_mine_cuenta_como_del_rival(self):
+        grid = strategy.parse_board(board(*['.......'] * 5, 'AXY....'))
+        position, mask, _ = strategy._to_bitboards(grid, 'A')
+
+        self.assertEqual(position.bit_count(), 1)
+        self.assertEqual((position ^ mask).bit_count(), 2)
+
+    def test_winning_spots_agree_with_the_grid_search(self):
+        """Property test: en posiciones al azar, las casillas ganadoras
+        jugables de los bitboards son las mismas columnas que encuentra
+        `winning_columns` moviendo fichas en la grilla."""
+        rng = random.Random(20260825)
+
+        for _ in range(200):
+            grid = [['.'] * 7 for _ in range(6)]
+            for turn in range(rng.randint(0, 30)):
+                columns = strategy.valid_columns(grid)
+                if not columns:
+                    break
+                col = rng.choice(columns)
+                grid[strategy._landing_row(grid, col)][col] = 'AB'[turn % 2]
+
+            for piece in 'AB':
+                position, mask, geo = strategy._to_bitboards(grid, piece)
+                spots = strategy._winning_spots(position, mask, geo)
+                playable = (mask + geo.bottom) & geo.board
+                from_bits = [
+                    col for col in range(7)
+                    if spots & playable & geo.column[col]
+                ]
+
+                self.assertEqual(
+                    from_bits,
+                    strategy.winning_columns(grid, piece),
+                    render(grid),
+                )
+
+    def test_a_line_does_not_wrap_around_the_edge(self):
+        """Tres fichas al final de una fila no se enganchan con la de al lado
+        de la fila siguiente."""
+        grid = strategy.parse_board(
+            board(*['.......'] * 4, 'A......', '....AAA')
+        )
+        position, mask, geo = strategy._to_bitboards(grid, 'A')
+        spots = strategy._winning_spots(position, mask, geo)
+        playable = (mask + geo.bottom) & geo.board
+
+        self.assertEqual(spots & playable, playable & geo.column[3])
+
+
+class TestForcedLines(unittest.TestCase):
+    def test_builds_the_double_threat(self):
+        """Con ..AA.. la unica jugada que gana a la fuerza es la col 4: deja
+        AAA con las dos puntas libres y el rival solo puede tapar una."""
+        self.assertEqual(
+            strategy.choose_column(
+                board(*['.......'] * 5, 'B.AA..B'), 'A', **FAST),
+            4,
+        )
+
+    def test_a_lost_position_still_returns_a_legal_column(self):
+        """El rival tiene dos amenazas jugables: se pierda como se pierda, hay
+        que devolver una columna valida."""
+        lost = board(*['.......'] * 5, '.BBB...')
+        grid = strategy.parse_board(lost)
+
+        self.assertIn(
+            strategy.choose_column(lost, 'A', **FAST),
+            strategy.valid_columns(grid),
+        )
+
+    def test_finds_the_win_before_running_out_of_depth(self):
+        """El mate esta a 5 plies; con profundidad 3 no se llega, pero las
+        podas exactas lo detectan igual."""
+        grid = strategy.parse_board(board(*['.......'] * 5, 'B.AA..B'))
+
+        self.assertEqual(
+            strategy.best_column(grid, 'A', max_depth=3, **FAST), 4)
+
+
+class TestOtherBoardSizes(unittest.TestCase):
+    def test_plays_on_a_square_board(self):
+        small = board(*['.....'] * 5)
+
+        self.assertIn(strategy.choose_column(small, 'A', **FAST), range(5))
+
+    def test_plays_on_a_wider_board(self):
+        wide = board(*['.' * 9] * 7)
+
+        self.assertIn(strategy.choose_column(wide, 'A', **FAST), range(9))
+
+
+class TestNeverLoses(unittest.TestCase):
+    def test_does_not_lose_to_a_greedy_opponent(self):
+        """Rival tipico de torneo: gana si puede, tapa si tiene que tapar, y
+        si no juega lo mas al centro posible."""
+        def greedy(grid, me, rival):
+            for piece in (me, rival):
+                wins = strategy.winning_columns(grid, piece)
+                if wins:
+                    return wins[0]
+            return strategy._ordered_columns(
+                strategy.valid_columns(grid), len(grid[0]))[0]
+
+        for engine_starts in (True, False):
+            grid = strategy.parse_board(EMPTY_BOARD)
+            for turn in range(42):
+                columns = strategy.valid_columns(grid)
+                if not columns:
+                    break
+                engine_turn = (turn % 2 == 0) == engine_starts
+                piece = 'A' if engine_turn else 'B'
+                if engine_turn:
+                    col = strategy.choose_column(render(grid), 'A', **FAST)
+                else:
+                    col = greedy(grid, 'B', 'A')
+                self.assertIn(col, columns)
+                row = strategy._landing_row(grid, col)
+                grid[row][col] = piece
+                if strategy._is_win(grid, row, col, piece):
+                    self.assertEqual(
+                        piece, 'A',
+                        'perdio contra el rival goloso abriendo={}'.format(
+                            engine_starts),
+                    )
+                    break
+
+
+class TestResolvePiece(unittest.TestCase):
+    def test_trusts_the_server_when_the_piece_is_on_the_board(self):
+        grid = strategy.parse_board(board(*['.......'] * 5, 'AB.....'))
+
+        self.assertEqual(strategy.resolve_piece(grid, 'B'), 'B')
+
+    def test_an_empty_board_leaves_the_piece_as_is(self):
+        grid = strategy.parse_board(EMPTY_BOARD)
+
+        self.assertEqual(strategy.resolve_piece(grid, 'X'), 'X')
+
+    def test_our_first_move_leaves_the_piece_as_is(self):
+        """Solo jugo el rival: que nuestra ficha no este es lo normal."""
+        grid = strategy.parse_board(board(*['.......'] * 5, '...B...'))
+
+        self.assertEqual(strategy.resolve_piece(grid, 'A'), 'A')
+
+    def test_a_side_that_matches_nothing_is_deduced_by_counting(self):
+        """Si el server dice 'red' y el tablero viene con X y O, la nuestra es
+        la que tiene menos fichas: es la que tiene que mover."""
+        grid = strategy.parse_board(
+            board('.......', '.......', '.......', '.......', '...X...',
+                  '..XOX..')
+        )
+
+        self.assertEqual(strategy.resolve_piece(grid, 'r'), 'O')
+
+    def test_the_deduced_piece_is_the_one_the_engine_plays(self):
+        """Con X a punto de hacer 4 en fila, jugamos como O y hay que tapar."""
+        mismatched = board(*['.......'] * 5, 'XXX.OO.')
+
+        self.assertEqual(strategy.choose_column(mismatched, 'rojo', **FAST), 3)
+
+
+def solve(state, me, rival, memo):
+    """Valor exacto de la posicion para el que mueve: +1 gana, 0 empata, -1
+    pierde. Sin heuristica y sin limite de profundidad, o sea la verdad."""
+    cached = memo.get((state, me))
+    if cached is not None:
+        return cached
+
+    grid = [list(row) for row in state]
+    best = None
+    for col in strategy.valid_columns(grid):
+        row = strategy._landing_row(grid, col)
+        grid[row][col] = me
+        if strategy._is_win(grid, row, col, me):
+            value = 1
+        else:
+            value = -solve(
+                tuple(''.join(r) for r in grid), rival, me, memo)
+        grid[row][col] = strategy.EMPTY
+        if best is None or value > best:
+            best = value
+        if best == 1:
+            break
+
+    best = 0 if best is None else best
+    memo[(state, me)] = best
+    return best
+
+
+class TestPlaysPerfectlyOnASmallBoard(unittest.TestCase):
+    """En un tablero de 4x4 el motor llega hasta el final de la partida, asi
+    que se le puede exigir juego perfecto: se compara contra un solucionador
+    exacto por fuerza bruta."""
+
+    def exact_values(self, grid, me, rival, memo):
+        values = {}
+        for col in strategy.valid_columns(grid):
+            row = strategy._landing_row(grid, col)
+            grid[row][col] = me
+            if strategy._is_win(grid, row, col, me):
+                values[col] = 1
+            else:
+                values[col] = -solve(
+                    tuple(''.join(r) for r in grid), rival, me, memo)
+            grid[row][col] = strategy.EMPTY
+        return values
+
+    # Presupuesto amplio a proposito: aca no se mide velocidad sino si la
+    # jugada es la correcta, y el motor corta solo cuando termina de resolver
+    # el tablero (no gasta el presupuesto entero).
+    SOLVE = {'time_budget': 5}
+
+    def test_never_picks_a_move_that_throws_the_game_away(self):
+        rng = random.Random(20260825)
+        memo = {}
+        checked = 0
+
+        for _ in range(24):
+            grid = [[strategy.EMPTY] * 4 for _ in range(4)]
+            piece = 'A'
+            for _ in range(rng.randint(3, 9)):
+                columns = strategy.valid_columns(grid)
+                if not columns:
+                    break
+                col = rng.choice(columns)
+                row = strategy._landing_row(grid, col)
+                grid[row][col] = piece
+                if strategy._is_win(grid, row, col, piece):
+                    grid[row][col] = strategy.EMPTY
+                    break
+                piece = 'B' if piece == 'A' else 'A'
+
+            if not strategy.valid_columns(grid):
+                continue
+
+            rival = 'B' if piece == 'A' else 'A'
+            values = self.exact_values(grid, piece, rival, memo)
+            chosen = strategy.choose_column(render(grid), piece, **self.SOLVE)
+            checked += 1
+
+            self.assertEqual(
+                values[chosen], max(values.values()),
+                'jugando {} eligio la columna {}; valores exactos {} en\n{}'
+                .format(piece, chosen, values, render(grid)),
+            )
+
+        self.assertGreater(checked, 18, 'casi no se probaron posiciones')
 
 
 if __name__ == '__main__':
