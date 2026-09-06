@@ -13,7 +13,7 @@ Para buscar, en cambio, el tablero se pasa a *bitboards*: dos enteros (las
 fichas del que mueve y las de todos) con un bit por celda y una fila centinela
 por columna, al estilo Fhourstones. Todo lo caro de la busqueda (detectar
 lineas de 4, listar jugadas, medir amenazas) queda en un par de shifts y
-`bit_count()`, y eso es lo que permite bajar 10 a 12 plies en 0.8 segundos en
+`bit_count()`, y eso es lo que permite bajar 10 a 13 plies en 1.5 segundos en
 vez de los 6 que daba la version sobre listas. Ojo con las mascaras negadas:
 `~mask` da un entero negativo y en CPython operarlo cuesta varias veces mas que
 un `board ^ mask`, que sobre subconjuntos del tablero es lo mismo.
@@ -34,9 +34,10 @@ WIN_LENGTH = 4
 
 # La busqueda se corta por reloj, no por profundidad: MAX_DEPTH es solo el
 # techo (un tablero de 7x6 se llena en 42 jugadas) y TIME_BUDGET es el que
-# manda. El server penaliza si el turno se vence.
+# manda. Ojo al subirlo: el server penaliza si el turno se vence, y al
+# presupuesto hay que descontarle la ida y vuelta por el websocket.
 MAX_DEPTH = 42
-TIME_BUDGET = 0.8
+TIME_BUDGET = 1.5
 
 WIN_SCORE = 10 ** 6
 INF = 10 ** 9

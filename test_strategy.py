@@ -378,7 +378,8 @@ class TestForcedLines(unittest.TestCase):
         podas exactas lo detectan igual."""
         grid = strategy.parse_board(board(*['.......'] * 5, 'B.AA..B'))
 
-        self.assertEqual(strategy.best_column(grid, 'A', max_depth=3), 4)
+        self.assertEqual(
+            strategy.best_column(grid, 'A', max_depth=3, **FAST), 4)
 
 
 class TestOtherBoardSizes(unittest.TestCase):

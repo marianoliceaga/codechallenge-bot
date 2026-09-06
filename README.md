@@ -98,7 +98,7 @@ corte por profundidad. Por eso el motor encuentra mates forzados bastante más
 lejos que el límite nominal de la búsqueda (por ejemplo ve un mate a 5 jugadas
 buscando a profundidad 3).
 
-Con esto, en los 0.8 s de `TIME_BUDGET` baja **10 plies en la apertura y 12 en
+Con esto, en los 1.5 s de `TIME_BUDGET` baja **10 plies en la apertura y 13 en
 el medio juego**, a unos 170.000 nodos por segundo; en el final resuelve la
 partida entera. La versión anterior, sobre listas de Python, llegaba a 6.
 
@@ -122,16 +122,17 @@ rica (contar las ventanas de 4 todavía vivas, como hacía la versión anterior)
 profundidad. En este juego la profundidad le gana a la evaluación, así que la
 heurística quedó deliberadamente barata.
 
-La búsqueda se corta por reloj (`TIME_BUDGET`, 0.8 s) para no perder el turno
+La búsqueda se corta por reloj (`TIME_BUDGET`, 1.5 s) para no perder el turno
 por timeout. Una profundidad solo se toma en cuenta si se terminó de explorar:
 si se corta a mitad de camino vale el resultado de la anterior, porque si no se
 estarían comparando puntajes que salen de mirar distinta cantidad de jugadas.
 
 Para ajustar la fuerza está `TIME_BUDGET`: es lo que más rinde, porque cada vez
-que se duplica el presupuesto entra aproximadamente un ply más de búsqueda. Si
-el server tolera turnos más largos, subirlo es gratis. Los pesos de la
-heurística son las constantes `SCORE_*`, y `MAX_DEPTH` es solo el techo (42, un
-tablero lleno).
+que se duplica el presupuesto entra aproximadamente un ply más de búsqueda.
+**Ojo al subirlo**: el server penaliza el turno vencido, y al presupuesto hay
+que descontarle la ida y vuelta por el websocket, así que conviene dejar
+margen contra el timeout real del server. Los pesos de la heurística son las
+constantes `SCORE_*`, y `MAX_DEPTH` es solo el techo (42, un tablero lleno).
 
 ### Suposiciones sobre el tablero (verificar con una partida real)
 
