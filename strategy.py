@@ -1,565 +1,691 @@
-"""Motor de juego para Connect 4.
+"""Motor de juego para Snake (reglas v5 de CodeChallenge, 23 Sep 2026).
 
-El server manda el tablero como string y espera de vuelta un numero de columna.
-Como el formato exacto no esta documentado, `parse_board` es deliberadamente
-tolerante: acepta filas separadas por saltos de linea o por '|', ignora los '|'
-que sean separadores de celda y toma como vacia cualquier celda en EMPTY_CHARS.
+Dos viboras, una por jugador, que mueven por turnos. El server manda el tablero
+como string (filas envueltas en `|...|` y unidas por saltos de linea) y espera
+de vuelta una direccion: `up`, `down`, `left` o `right`.
 
-La orientacion (si la fila 0 es la de arriba o la de abajo) se deduce del propio
-tablero, porque en Connect 4 las fichas se apilan contra el lado de la gravedad.
-Hacia afuera siempre se trabaja con la fila 0 arriba.
+Lo que hay en el tablero y lo que vale:
 
-Para buscar, en cambio, el tablero se pasa a *bitboards*: dos enteros (las
-fichas del que mueve y las de todos) con un bit por celda y una fila centinela
-por columna, al estilo Fhourstones. Todo lo caro de la busqueda (detectar
-lineas de 4, listar jugadas, medir amenazas) queda en un par de shifts y
-`bit_count()`, y eso es lo que permite bajar 10 a 13 plies en 1.5 segundos en
-vez de los 6 que daba la version sobre listas. Ojo con las mascaras negadas:
-`~mask` da un entero negativo y en CPython operarlo cuesta varias veces mas que
-un `board ^ mask`, que sobre subconjuntos del tablero es lo mismo.
+- `A`/`B` cabezas, `a`/`b` cuerpos. Chocar contra el borde, un cuerpo o la
+  otra vibora termina la partida: el que choca pierde.
+- Comida numerada `1`..`9`: hay cinco digitos consecutivos (ciclicos, despues
+  del 9 viene el 1) y hay que comerlos en orden. El que toca es el que no tiene
+  a su predecesor en el tablero (con `1 6 7 8 9` toca el 6, no el 1). El
+  correcto vale `digito * 100 * multiplicador` y hace crecer; cualquier otro
+  es -500.
+- `X`: +50 y el multiplicador propio sube un escalon para siempre. No crece.
+- `#`: muro que se achica cada ronda. Pegarle es -500 y la vibora se queda
+  quieta, pero la partida sigue (a veces es la unica salida que no mata).
+- Cada movimiento que sobrevive suma +1. Si nadie choca, gana el que tiene mas
+  puntos cuando se acaban los `remaining_moves` (cuentan las jugadas de los
+  dos).
+- `*` es la comida de las reglas viejas (+100); se sigue entendiendo por las
+  dudas.
 
-Encima de eso hay negamax con alpha-beta, profundizacion iterativa, tabla de
-transposicion, killer moves y las dos podas de Pascal Pons: si el rival tiene
-dos amenazas jugables la posicion ya esta perdida, y jugar debajo de una
-casilla ganadora del rival tambien pierde. Las dos reglas son exactas, asi que
-valen aunque la busqueda se corte por profundidad, y hacen que el motor vea los
-mates forzados mucho antes que el limite de la busqueda.
+La decision sale de un minimax con poda alpha-beta y profundizacion iterativa
+cortada por reloj. Los estados se simulan con las mismas reglas del server
+(salvo lo que aparece al azar: comida, `X` y muros nuevos). En las hojas se
+evalua:
+
+- la diferencia de puntaje real y la de multiplicadores, valuada por las
+  jugadas que quedan;
+- la carrera por la comida: quien llega primero al digito que toca, y el que
+  la pierde se acomoda cerca del siguiente;
+- las `X` al alcance de cada uno;
+- el territorio (celdas a las que cada vibora llega antes) y si alguna quedo
+  encerrada en menos lugar que su largo. Para eso el BFS sabe que los cuerpos
+  se van liberando desde la cola.
 """
 
 import time
 
-EMPTY = '.'
-EMPTY_CHARS = frozenset('.-_ 0*')
-WIN_LENGTH = 4
+DIRECTIONS = {
+    'up': (-1, 0),
+    'right': (0, 1),
+    'down': (1, 0),
+    'left': (0, -1),
+}
+DEFAULT_DIRECTION = 'up'
 
-# La busqueda se corta por reloj, no por profundidad: MAX_DEPTH es solo el
-# techo (un tablero de 7x6 se llena en 42 jugadas) y TIME_BUDGET es el que
-# manda. Ojo al subirlo: el server penaliza si el turno se vence, y al
-# presupuesto hay que descontarle la ida y vuelta por el websocket.
-MAX_DEPTH = 42
-TIME_BUDGET = 1.5
+# Contenido de una celda, ya normalizado. Las dos viboras se guardan como
+# SNAKE: para chocar da lo mismo de quien es el cuerpo.
+EMPTY = ' '
+WALL = '#'
+MULTIPLIER = 'X'
+STAR = '*'
+SNAKE = 's'
+DIGITS = frozenset('123456789')
+EMPTY_CHARS = frozenset(' .')
+_BORDER_CHARS = frozenset('+-=')
 
-WIN_SCORE = 10 ** 6
+# Reglamento.
+MOVE_POINTS = 1
+FOOD_POINTS = 100
+MULTIPLIER_POINTS = 50
+PENALTY = 500
+DEFAULT_REMAINING_MOVES = 300
+
+# La busqueda se corta por reloj. Al presupuesto hay que descontarle la ida y
+# vuelta por el websocket: el server no espera para siempre.
+TIME_BUDGET = 1.0
+MAX_DEPTH = 32
+
+WIN = 10 ** 6
 INF = 10 ** 9
+_DECIDED = WIN - 10 ** 4   # por encima de esto el resultado ya esta decidido
 
-# Pesos de la heuristica de hojas.
-SCORE_PLAYABLE_THREAT = 60   # amenaza que se puede completar en el acto
-SCORE_THREAT = 18            # amenaza esperando a que se llene la columna
-SCORE_PARITY = 24            # amenaza en una fila de la paridad que me sirve
-SCORE_CENTER = 2             # por ficha y por banda de columnas
-
-# Rangos del ordenamiento de jugadas, y desde que profundidad conviene pagar
-# el ordenamiento fino (contar amenazas creadas).
-_ORDER_TT = 1 << 20
-_ORDER_KILLER = 1 << 19
-_ORDER_THREAT = 1 << 8
-_ORDER_MIN_DEPTH = 4
-
-# Cada 1024 nodos se mira el reloj: mirarlo en cada nodo cuesta mas que buscar.
-_TIME_CHECK_MASK = 1023
-
-# Flags de la tabla de transposicion.
-_EXACT, _LOWER, _UPPER = 0, 1, 2
+# Pesos de la evaluacion.
+GAMMA = 0.9                 # descuento por cada paso hasta un objetivo
+MULT_VALUE_PER_MOVE = 10    # cuanto rinde un escalon de multiplicador por jugada
+FOOD_CHAIN = 3              # cuantos digitos de la secuencia mira la carrera
+TERRITORY_WEIGHT = 1        # por celda de territorio
+TRAPPED = 5000              # encerrado en menos lugar que el propio largo
+TRAPPED_PER_CELL = 200
 
 
 class BoardError(ValueError):
     """El string del tablero no se pudo interpretar."""
 
 
-def parse_board(board_str):
-    """Devuelve el tablero como lista de filas (fila 0 = arriba)."""
-    # Solo se recortan saltos de linea: un espacio puede ser una celda vacia.
-    text = (board_str or '').strip('\r\n')
-    if not text.strip():
-        raise BoardError('tablero vacio')
+def parse_board(board, cols=None):
+    """Devuelve el tablero como lista de filas (fila 0 = arriba), sin los `|`.
 
-    raw_rows = text.splitlines() if '\n' in text else text.split('|')
+    Solo se recortan los `|` de los costados: los espacios son celdas vacias.
+    """
+    text = (board or '').replace('\r', '')
+    lines = text.split('\n')
+    if len(lines) == 1 and '||' in text:
+        lines = text.split('||')
 
     grid = []
-    for raw in raw_rows:
-        cells = [
-            EMPTY if char in EMPTY_CHARS else char
-            for char in raw.replace('|', '').strip('\r')
-        ]
-        if cells:
-            grid.append(cells)
+    for line in lines:
+        if not line or set(line) <= _BORDER_CHARS:
+            continue
+        if line.startswith('|'):
+            line = line[1:]
+        if line.endswith('|'):
+            line = line[:-1]
+        grid.append(line)
 
     if not grid:
-        raise BoardError('no se encontraron filas en {!r}'.format(board_str))
-
-    width = len(grid[0])
-    if any(len(row) != width for row in grid):
-        raise BoardError('filas de distinto ancho en {!r}'.format(board_str))
-    if len(grid) < WIN_LENGTH or width < WIN_LENGTH:
-        raise BoardError(
-            'tablero de {}x{}, muy chico para Connect 4'.format(
-                len(grid), width
-            )
-        )
-
-    if not _is_top_down(grid) and _is_top_down(grid[::-1]):
-        grid.reverse()
-    return grid
+        raise BoardError('tablero vacio')
+    width = cols or max(len(row) for row in grid)
+    if width <= 0:
+        raise BoardError('tablero sin columnas')
+    return [row[:width].ljust(width) for row in grid]
 
 
-def _is_top_down(grid):
-    """True si las fichas se apilan hacia abajo, que es como las guardamos.
+def next_digit(digit):
+    return digit % 9 + 1
 
-    Con gravedad hacia abajo ninguna columna puede tener un hueco debajo de una
-    ficha. Un tablero vacio (o lleno) cumple las dos orientaciones y se toma
-    como esta.
+
+def previous_digit(digit):
+    return (digit - 2) % 9 + 1
+
+
+def target_digit(digits):
+    """El digito que toca comer: el que no tiene a su predecesor en juego.
+
+    Normalmente hay uno solo. Si por algo hubiera varios, gana el que arranca
+    la racha mas larga (y a igualdad, el menor).
     """
-    for col in range(len(grid[0])):
-        seen_piece = False
-        for row in grid:
-            if row[col] != EMPTY:
-                seen_piece = True
-            elif seen_piece:
-                return False
-    return True
+    present = set(digits)
+    starts = [d for d in present if previous_digit(d) not in present]
+    if not starts:
+        return None
+
+    def run_length(d):
+        n = 0
+        while d in present and n < 9:
+            n += 1
+            d = next_digit(d)
+        return n
+
+    return max(starts, key=lambda d: (run_length(d), -d))
 
 
-def valid_columns(grid):
-    return [col for col in range(len(grid[0])) if grid[0][col] == EMPTY]
+_NEIGHBORS = {}
 
 
-def _landing_row(grid, col):
-    """Fila donde caeria una ficha en `col`, o None si la columna esta llena."""
-    for row in range(len(grid) - 1, -1, -1):
-        if grid[row][col] == EMPTY:
-            return row
+def neighbors(rows, cols):
+    """Vecinos ortogonales de cada celda, cacheados por tamano de tablero."""
+    key = (rows, cols)
+    if key not in _NEIGHBORS:
+        table = []
+        for r in range(rows):
+            for c in range(cols):
+                cells = []
+                for dr, dc in DIRECTIONS.values():
+                    nr, nc = r + dr, c + dc
+                    if 0 <= nr < rows and 0 <= nc < cols:
+                        cells.append(nr * cols + nc)
+                table.append(tuple(cells))
+        _NEIGHBORS[key] = tuple(table)
+    return _NEIGHBORS[key]
+
+
+def trace_body(head, cells, neigh, limit=20000):
+    """Ordena el cuerpo de la cola a la cabeza.
+
+    El tablero no dice el orden de los segmentos, asi que se busca un camino
+    desde la cabeza que pase por todas las celdas del cuerpo (probando primero
+    la celda con menos salidas, que casi nunca obliga a volver atras). Si el
+    cuerpo esta tan enroscado que no aparece en `limit` pasos, se usa el camino
+    mas largo encontrado y lo que sobra se pone del lado de la cola.
+    """
+    path = [head]
+    seen = {head}
+    best = [head]
+    budget = [limit]
+
+    def free_neighbors(cell):
+        return [n for n in neigh[cell] if n in cells and n not in seen]
+
+    def extend():
+        if len(path) - 1 == len(cells):
+            return True
+        budget[0] -= 1
+        if budget[0] < 0:
+            return False
+        options = free_neighbors(path[-1])
+        options.sort(key=lambda n: len(free_neighbors(n)))
+        for n in options:
+            path.append(n)
+            seen.add(n)
+            if len(path) > len(best):
+                best[:] = path
+            if extend():
+                return True
+            path.pop()
+            seen.discard(n)
+        return False
+
+    order = path if extend() else best + sorted(cells.difference(best))
+    return tuple(reversed(order))
+
+
+def _as_int(value, default):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+class State:
+    """Una posicion. El jugador 0 es el bot y el 1 el rival.
+
+    `bodies` van de la cola a la cabeza. `digits` e `items` (las `X` y `*`) se
+    comparten entre estados y solo se copian cuando alguien come.
+    """
+
+    __slots__ = ('rows', 'cols', 'grid', 'bodies', 'scores', 'mults',
+                 'digits', 'items', 'target', 'plies_left', 'to_move',
+                 'crashed')
+
+    def __init__(self, rows, cols, grid, bodies, scores=(0, 0), mults=(1, 1),
+                 digits=None, items=None, target=None,
+                 plies_left=DEFAULT_REMAINING_MOVES, to_move=0):
+        self.rows = rows
+        self.cols = cols
+        self.grid = list(grid)
+        self.bodies = [tuple(b) for b in bodies]
+        self.scores = list(scores)
+        self.mults = list(mults)
+        self.digits = dict(digits or {})
+        self.items = dict(items or {})
+        self.target = target
+        self.plies_left = plies_left
+        self.to_move = to_move
+        self.crashed = None
+
+    def copy(self):
+        s = State.__new__(State)
+        s.rows = self.rows
+        s.cols = self.cols
+        s.grid = self.grid[:]
+        s.bodies = self.bodies[:]
+        s.scores = self.scores[:]
+        s.mults = self.mults[:]
+        s.digits = self.digits
+        s.items = self.items
+        s.target = self.target
+        s.plies_left = self.plies_left
+        s.to_move = self.to_move
+        s.crashed = self.crashed
+        return s
+
+    def head(self, player):
+        body = self.bodies[player]
+        return body[-1] if body else None
+
+
+def build_state(turn_data):
+    """Arma el `State` a partir del `turn_data` de un `your_turn`.
+
+    Devuelve None si en el tablero no esta la cabeza propia. Se asume que el
+    lado `A` es `player_1` (`score_1`, `multiplier_1`) y el `B` `player_2`.
+    """
+    rows_text = parse_board(turn_data.get('board'),
+                            _as_int(turn_data.get('cols'), None))
+    rows, cols = len(rows_text), len(rows_text[0])
+
+    me = str(turn_data.get('side') or 'A').strip().upper()[:1]
+    if me not in ('A', 'B'):
+        me = 'A'
+    sides = (me, 'B' if me == 'A' else 'A')
+
+    grid = []
+    heads = {}
+    body_cells = {'A': set(), 'B': set()}
+    digits = {}
+    items = {}
+    for r, line in enumerate(rows_text):
+        for c, ch in enumerate(line):
+            i = r * cols + c
+            if ch in ('A', 'B'):
+                heads.setdefault(ch, i)
+                grid.append(SNAKE)
+            elif ch in ('a', 'b'):
+                body_cells[ch.upper()].add(i)
+                grid.append(SNAKE)
+            elif ch in DIGITS:
+                digits.setdefault(int(ch), i)
+                grid.append(ch)
+            elif ch in (MULTIPLIER, STAR):
+                items[i] = ch
+                grid.append(ch)
+            elif ch in EMPTY_CHARS:
+                grid.append(EMPTY)
+            else:
+                # '#' o algo que no conocemos: mejor no pisarlo.
+                grid.append(WALL)
+
+    if me not in heads:
+        return None
+
+    neigh = neighbors(rows, cols)
+    bodies = []
+    for side in sides:
+        if side in heads:
+            bodies.append(trace_body(heads[side], body_cells[side], neigh))
+        else:
+            bodies.append(())
+
+    numbers = tuple('1' if side == 'A' else '2' for side in sides)
+    scores = [_as_int(turn_data.get('score_' + n), 0) for n in numbers]
+    mults = [max(1, _as_int(turn_data.get('multiplier_' + n), 1)) for n in numbers]
+    plies_left = _as_int(turn_data.get('remaining_moves'), DEFAULT_REMAINING_MOVES)
+
+    return State(rows, cols, grid, bodies, scores, mults, digits, items,
+                 target_digit(digits), max(1, plies_left))
+
+
+def step(state, player, direction):
+    """Aplica una jugada y devuelve el estado nuevo (el original no cambia).
+
+    `direction=None` es pasar (solo para un rival que no esta en el tablero).
+    Moverse sobre la propia cola se toma como choque: no sabemos si el server
+    la corre antes o despues de mirar la colision, y mejor no averiguarlo.
+    """
+    s = state.copy()
+    s.plies_left -= 1
+    s.to_move = 1 - player
+    body = state.bodies[player]
+    if direction is None or not body:
+        return s
+
+    cols = state.cols
+    r, c = divmod(body[-1], cols)
+    dr, dc = DIRECTIONS[direction]
+    r += dr
+    c += dc
+    if not (0 <= r < state.rows and 0 <= c < cols):
+        s.crashed = player
+        return s
+    dest = r * cols + c
+    cell = state.grid[dest]
+    if cell == SNAKE:
+        s.crashed = player
+        return s
+    if cell == WALL:
+        s.scores[player] -= PENALTY
+        return s
+
+    s.scores[player] += MOVE_POINTS
+    grow = False
+    if cell in DIGITS:
+        digit = int(cell)
+        if digit == state.target:
+            s.digits = dict(state.digits)
+            s.digits.pop(digit, None)
+            s.scores[player] += digit * FOOD_POINTS * state.mults[player]
+            grow = True
+            following = next_digit(digit)
+            s.target = following if following in s.digits else None
+        else:
+            # El server lo vuelve a poner en otro lado. No sabemos donde, asi
+            # que sigue en la secuencia con su celda vieja: si desapareciera,
+            # comerlo "cortaria" la carrera y pareceria negocio.
+            s.scores[player] -= PENALTY
+    elif cell == MULTIPLIER or cell == STAR:
+        s.items = dict(state.items)
+        s.items.pop(dest, None)
+        if cell == MULTIPLIER:
+            s.scores[player] += MULTIPLIER_POINTS
+            s.mults[player] += 1
+        else:
+            s.scores[player] += FOOD_POINTS * state.mults[player]
+            grow = True
+
+    grid = s.grid
+    if grow:
+        s.bodies[player] = body + (dest,)
+    else:
+        grid[body[0]] = EMPTY
+        s.bodies[player] = body[1:] + (dest,)
+    grid[dest] = SNAKE
+    return s
+
+
+def legal_moves(state, player):
+    """Las jugadas que no chocan. Pegarle al muro `#` cuenta: no mata."""
+    body = state.bodies[player]
+    if not body:
+        return [None]
+    cols = state.cols
+    r, c = divmod(body[-1], cols)
+    moves = []
+    for name, (dr, dc) in DIRECTIONS.items():
+        nr, nc = r + dr, c + dc
+        if 0 <= nr < state.rows and 0 <= nc < cols \
+                and state.grid[nr * cols + nc] != SNAKE:
+            moves.append(name)
+    return moves
+
+
+def _goal(state, player):
+    """Hacia donde conviene ir a ojo, para ordenar las jugadas."""
+    if state.target is not None and state.target in state.digits:
+        return state.digits[state.target]
+    for cell in state.items:
+        return cell
     return None
 
 
-def _is_win(grid, row, col, piece):
-    """True si la ficha recien puesta en (row, col) cierra WIN_LENGTH en linea."""
-    height, width = len(grid), len(grid[0])
-    for d_row, d_col in ((0, 1), (1, 0), (1, 1), (1, -1)):
-        count = 1
-        for direction in (1, -1):
-            r, c = row + d_row * direction, col + d_col * direction
-            while (
-                0 <= r < height
-                and 0 <= c < width
-                and grid[r][c] == piece
-            ):
-                count += 1
-                r += d_row * direction
-                c += d_col * direction
-        if count >= WIN_LENGTH:
-            return True
-    return False
+def _children(state, player, moves):
+    """(jugada, estado) ordenados de mas a menos prometedor para `player`."""
+    goal = _goal(state, player)
+    cols = state.cols
+    before = state.scores[player]
+    scored = []
+    for move in moves:
+        child = step(state, player, move)
+        key = child.scores[player] - before
+        head = child.head(player)
+        if goal is not None and head is not None:
+            hr, hc = divmod(head, cols)
+            gr, gc = divmod(goal, cols)
+            key -= abs(hr - gr) + abs(hc - gc)
+        scored.append((key, move, child))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [(move, child) for _, move, child in scored]
 
 
-def winning_columns(grid, piece):
-    """Columnas donde `piece` gana en el acto."""
-    wins = []
-    for col in valid_columns(grid):
-        row = _landing_row(grid, col)
-        grid[row][col] = piece
-        if _is_win(grid, row, col, piece):
-            wins.append(col)
-        grid[row][col] = EMPTY
-    return wins
+def _free_times(state):
+    """Celda de cuerpo -> cuantas jugadas faltan para que quede libre."""
+    free = {}
+    for body in state.bodies:
+        for k, cell in enumerate(body):
+            free[cell] = k + 1
+    return free
 
 
-def _ordered_columns(columns, width):
-    """Del centro hacia afuera: mejora las podas de alpha-beta."""
-    center = (width - 1) / 2
-    return sorted(columns, key=lambda col: abs(col - center))
+def distances(state, player, free=None):
+    """BFS desde la cabeza de `player`: (distancias, celdas alcanzables).
 
-
-class _Geometry:
-    """Mascaras fijas de un tablero de ancho x alto, calculadas una sola vez.
-
-    Cada columna ocupa `height + 1` bits: la fila de arriba queda siempre en
-    cero y hace de centinela, para que los desplazamientos no encadenen fichas
-    de columnas vecinas. El bit de (col, fila) es `col * step + fila`, con la
-    fila 0 abajo (al reves que la grilla, que se guarda con la 0 arriba).
+    Los cuerpos cuentan como libres cuando su segmento ya se habria corrido,
+    siempre que haya lugar para dar vueltas mientras tanto. Los digitos se
+    alcanzan pero no se atraviesan (comer el equivocado cuesta 500).
     """
-
-    __slots__ = (
-        'width', 'height', 'step', 'bottom', 'board', 'column',
-        'rows_first', 'rows_second', 'order', 'shifts', 'bands',
-    )
-
-    def __init__(self, width, height):
-        self.width = width
-        self.height = height
-        self.step = height + 1
-        self.bottom = sum(1 << (col * self.step) for col in range(width))
-        self.board = self.bottom * ((1 << height) - 1)
-        full = (1 << height) - 1
-        self.column = [full << (col * self.step) for col in range(width)]
-        # Una ficha vale mas cuanto mas al centro, porque entra en mas lineas
-        # de 4. Las columnas se agrupan por distancia al medio y cada grupo
-        # queda en una mascara, asi la evaluacion son unos pocos `bit_count`.
-        bands = {}
-        middle = (width - 1) / 2
-        for col in range(width):
-            weight = int(middle - abs(col - middle)) + 1
-            bands[weight] = bands.get(weight, 0) | self.column[col]
-        self.bands = tuple(sorted(bands.items()))
-        # Teoria de paridad: al que abre la partida le sirven las amenazas de
-        # las filas impares contando desde 1, o sea las de indice par.
-        self.rows_first = sum(
-            self.bottom << row for row in range(0, height, 2)
-        )
-        self.rows_second = sum(
-            self.bottom << row for row in range(1, height, 2)
-        )
-        self.order = _ordered_columns(range(width), width)
-        # Desplazamientos de la horizontal y las dos diagonales, ya
-        # multiplicados: `_winning_spots` corre en el nucleo de la busqueda.
-        self.shifts = tuple(
-            (step, 2 * step, 3 * step)
-            for step in (self.step - 1, self.step, self.step + 1)
-        )
-
-
-_GEOMETRIES = {}
-
-
-def _geometry(width, height):
-    geo = _GEOMETRIES.get((width, height))
-    if geo is None:
-        geo = _Geometry(width, height)
-        _GEOMETRIES[(width, height)] = geo
-    return geo
+    if free is None:
+        free = _free_times(state)
+    n = state.rows * state.cols
+    dist = [-1] * n
+    body = state.bodies[player]
+    if not body:
+        return dist, 0
+    grid = state.grid
+    neigh = neighbors(state.rows, state.cols)
+    start = body[-1]
+    dist[start] = 0
+    frontier = [start]
+    pending = {}
+    waiting = set()
+    area = 0
+    d = 0
+    while frontier or pending:
+        d += 1
+        reached = []
+        for i in frontier:
+            for j in neigh[i]:
+                if dist[j] >= 0:
+                    continue
+                ch = grid[j]
+                if ch == WALL:
+                    continue
+                if ch == SNAKE:
+                    ready = free.get(j, INF)
+                    if ready > d:
+                        if j not in waiting and ready < INF and area >= ready - d:
+                            waiting.add(j)
+                            pending.setdefault(ready, []).append(j)
+                        continue
+                dist[j] = d
+                area += 1
+                if ch not in DIGITS:
+                    reached.append(j)
+        for j in pending.pop(d, ()):
+            if dist[j] < 0:
+                dist[j] = d
+                area += 1
+                reached.append(j)
+        frontier = reached
+    return dist, area
 
 
-def _to_bitboards(grid, me):
-    """Pasa la grilla a (fichas de `me`, fichas de todos, geometria).
+def _trapped(area, length):
+    if length and area < length:
+        return TRAPPED + TRAPPED_PER_CELL * (length - area)
+    return 0
 
-    Cualquier ficha que no sea `me` cuenta como del rival, asi no importa si el
-    server manda una tercera marca rara.
+
+def _food_race(state, d0, d1, my_turn):
+    """Valor esperado de los proximos digitos de la secuencia para el bot.
+
+    La carrera se juega en orden: el que llega primero al digito que toca se lo
+    come y sale desde ahi (a ojo, en distancia Manhattan) hacia el siguiente;
+    el otro se va acercando al siguiente, pero no lo puede comer antes de que
+    le toque.
     """
-    height, width = len(grid), len(grid[0])
-    geo = _geometry(width, height)
-    position = mask = 0
-    for index, row in enumerate(grid):
-        shift = height - 1 - index
-        for col, cell in enumerate(row):
-            if cell == EMPTY:
-                continue
-            bit = 1 << (col * geo.step + shift)
-            mask |= bit
-            if cell == me:
-                position |= bit
-    return position, mask, geo
-
-
-def _winning_spots(position, mask, geo):
-    """Casillas vacias donde `position` cerraria una linea de 4."""
-    # Vertical: la casilla justo arriba de tres fichas apiladas.
-    spots = (position << 1) & (position << 2) & (position << 3)
-    # Horizontal y las dos diagonales. Los cuatro huecos posibles de cada linea
-    # (los dos extremos y los dos del medio) salen de estas seis combinaciones.
-    for one, two, three in geo.shifts:
-        pair = (position << one) & (position << two)
-        spots |= pair & (position << three)
-        spots |= pair & (position >> one)
-        pair = (position >> one) & (position >> two)
-        spots |= pair & (position << one)
-        spots |= pair & (position >> three)
-    return spots & (geo.board ^ mask)
-
-
-def _evaluate_bits(position, mask, geo, mine, theirs):
-    """Puntaje de la posicion, visto por el que tiene que mover.
-
-    `mine` y `theirs` son las casillas ganadoras de cada uno; se piden hechas
-    porque la busqueda ya las tiene calculadas.
-    """
-    opponent = position ^ mask
-    playable = (mask + geo.bottom) & geo.board
-
-    # Amenazas que se completan en la jugada siguiente. Viniendo de la busqueda
-    # las mias siempre dan cero (si tuviera una, el nodo ya habria devuelto
-    # victoria), pero la cuenta se hace igual para los dos lados para que el
-    # puntaje sea simetrico cuando se llama a `evaluate` desde afuera.
-    score = SCORE_PLAYABLE_THREAT * (
-        (mine & playable).bit_count() - (theirs & playable).bit_count()
-    )
-    score += SCORE_THREAT * (mine.bit_count() - theirs.bit_count())
-
-    # Con las fichas empatadas no se sabe quien abrio la partida, y sin eso el
-    # termino de paridad no significa nada.
-    played, faced = position.bit_count(), opponent.bit_count()
-    if played != faced:
-        if played > faced:
-            my_rows, their_rows = geo.rows_first, geo.rows_second
+    if state.target is None:
+        return 0
+    cols = state.cols
+    dist = (d0, d1)
+    origin = [None, None]   # None: sale desde la cabeza (vale el BFS)
+    clock = [0, 0]
+    ready = 0
+    value = 0.0
+    digit = state.target
+    for _ in range(FOOD_CHAIN):
+        cell = state.digits.get(digit)
+        if cell is None:
+            break
+        arrival = []
+        for p in (0, 1):
+            if origin[p] is None:
+                a = dist[p][cell]
+                if a < 0:
+                    arrival.append(None)
+                    continue
+            else:
+                r, c = divmod(origin[p], cols)
+                cr, cc = divmod(cell, cols)
+                a = clock[p] + abs(r - cr) + abs(c - cc)
+            arrival.append(max(a, ready + 1))
+        a0, a1 = arrival
+        if a0 is None and a1 is None:
+            break
+        if a1 is None or (a0 is not None and (a0 < a1 or (a0 == a1 and my_turn))):
+            winner, steps = 0, a0
         else:
-            my_rows, their_rows = geo.rows_second, geo.rows_first
-        score += SCORE_PARITY * (
-            (mine & my_rows).bit_count() - (theirs & their_rows).bit_count()
-        )
-
-    for weight, band in geo.bands:
-        score += SCORE_CENTER * weight * (
-            (position & band).bit_count() - (opponent & band).bit_count()
-        )
-    return score
+            winner, steps = 1, a1
+        points = digit * FOOD_POINTS * state.mults[winner] * GAMMA ** steps
+        value += points if winner == 0 else -points
+        origin[winner] = cell
+        clock[winner] = ready = steps
+        digit = next_digit(digit)
+    return value
 
 
-def evaluate(grid, me, opponent=None):
-    """Puntaje del tablero desde el punto de vista de `me`.
-
-    `opponent` se acepta por compatibilidad: en los bitboards toda ficha que no
-    sea `me` ya cuenta como del rival.
-    """
-    position, mask, geo = _to_bitboards(grid, me)
-    return _evaluate_bits(
-        position, mask, geo,
-        _winning_spots(position, mask, geo),
-        _winning_spots(position ^ mask, mask, geo),
-    )
+def final_score(state):
+    diff = state.scores[0] - state.scores[1]
+    if diff > 0:
+        return WIN + diff
+    if diff < 0:
+        return -WIN + diff
+    return 0
 
 
-class _TimeUp(Exception):
-    """Se acabo el presupuesto: la profundidad a medio explorar se descarta."""
+def evaluate(state):
+    """Valor de una posicion para el jugador 0 (mas alto, mejor para el bot)."""
+    free = _free_times(state)
+    dist = (distances(state, 0, free), distances(state, 1, free))
+    d0, area0 = dist[0]
+    d1, area1 = dist[1]
+    my_turn = state.to_move == 0
+    sign = (1, -1)
+
+    value = state.scores[0] - state.scores[1]
+    mult_value = MULT_VALUE_PER_MOVE * state.plies_left / 2
+    value += (state.mults[0] - state.mults[1]) * mult_value
+
+    def first(cell):
+        a, b = d0[cell], d1[cell]
+        if a >= 0 and (b < 0 or a < b or (a == b and my_turn)):
+            return 0, a
+        if b >= 0:
+            return 1, b
+        return None, 0
+
+    value += _food_race(state, d0, d1, my_turn)
+
+    for cell, ch in state.items.items():
+        winner, steps = first(cell)
+        if winner is None:
+            continue
+        if ch == MULTIPLIER:
+            gain = MULTIPLIER_POINTS + mult_value
+        else:
+            gain = FOOD_POINTS * state.mults[winner]
+        value += sign[winner] * gain * GAMMA ** steps
+
+    mine = theirs = 0
+    for a, b in zip(d0, d1):
+        if a >= 0 and (b < 0 or a < b or (a == b and my_turn)):
+            mine += 1
+        elif b >= 0:
+            theirs += 1
+    value += TERRITORY_WEIGHT * (mine - theirs)
+    value -= _trapped(area0, len(state.bodies[0]))
+    value += _trapped(area1, len(state.bodies[1]))
+    return value
 
 
-class _Search:
-    """Negamax con alpha-beta sobre bitboards.
+class _Timeout(Exception):
+    pass
 
-    La tabla de transposicion dura una sola busqueda: los puntajes de mate se
-    guardan relativos a la raiz, asi que reusarla en la jugada siguiente daria
-    distancias corridas.
-    """
 
-    __slots__ = ('geo', 'deadline', 'table', 'killers', 'nodes', 'spots')
-
-    def __init__(self, geo, deadline):
-        self.geo = geo
+class _Searcher:
+    def __init__(self, deadline):
         self.deadline = deadline
-        self.table = {}
-        self.killers = {}
         self.nodes = 0
-        self.spots = {}
 
-    def winning_spots(self, position, mask):
-        """`_winning_spots` con memoria: la misma posicion se llega por muchos
-        ordenes de jugadas distintos y el calculo es lo mas caro del nodo."""
-        key = position + mask
-        found = self.spots.get(key)
-        if found is None:
-            found = self.spots[key] = _winning_spots(position, mask, self.geo)
-        return found
-
-    def negamax(self, position, mask, depth, alpha, beta, ply,
-                my_spots, their_spots):
-        """Puntaje de la posicion para el que mueve.
-
-        `my_spots` y `their_spots` son las casillas ganadoras de cada lado. Las
-        arma el padre y bajan como parametro: despues de una jugada mia, las
-        del rival son las mismas de antes menos la casilla que acabo de tapar,
-        y las mias ya se calcularon al ordenar las jugadas. Recalcularlas en
-        cada nodo era la mitad del costo de la busqueda.
-        """
-        self.nodes += 1
-        if not self.nodes & _TIME_CHECK_MASK:
-            if time.monotonic() >= self.deadline:
-                raise _TimeUp
-
-        geo = self.geo
-        playable = (mask + geo.bottom) & geo.board
-        if not playable:
-            return 0  # tablero lleno: empate
-
-        # Gano ya: no hace falta mirar mas abajo.
-        if my_spots & playable:
-            return WIN_SCORE - ply
-
-        # Podas exactas: la posicion esta perdida valga lo que valga la
-        # heuristica, asi que se aplican aunque `depth` ya sea 0.
-        moves = playable
-        forced = moves & their_spots
-        if forced:
-            if forced & (forced - 1):
-                return ply + 1 - WIN_SCORE  # dos amenazas, no se tapan las dos
-            moves = forced                  # una sola: taparla es obligatorio
-        moves &= ~(their_spots >> 1)        # no dejarle la ganadora servida
-        if not moves:
-            return ply + 1 - WIN_SCORE
-
+    def search(self, state, depth, alpha, beta, ply):
+        if state.crashed is not None:
+            return -WIN + ply if state.crashed == 0 else WIN - ply
+        if state.plies_left <= 0:
+            return final_score(state)
         if depth <= 0:
-            return _evaluate_bits(position, mask, geo, my_spots, their_spots)
+            return evaluate(state)
+        self.nodes += 1
+        if time.perf_counter() > self.deadline:
+            raise _Timeout()
 
-        key = position + mask
-        tt_move = 0
-        entry = self.table.get(key)
-        if entry is not None:
-            entry_depth, flag, value, tt_move = entry
-            if entry_depth >= depth:
-                if flag == _EXACT:
-                    return value
-                if flag == _LOWER:
-                    alpha = max(alpha, value)
-                else:
-                    beta = min(beta, value)
+        player = state.to_move
+        moves = legal_moves(state, player)
+        if not moves:
+            # No queda otra que chocar.
+            return -WIN + ply + 1 if player == 0 else WIN - ply - 1
+
+        if player == 0:
+            best = -INF
+            for _, child in _children(state, 0, moves):
+                best = max(best, self.search(child, depth - 1, alpha, beta, ply + 1))
+                alpha = max(alpha, best)
                 if alpha >= beta:
-                    return value
-        alpha_start, beta_start = alpha, beta
-
-        order, column = geo.order, geo.column
-        bits = [moves & column[col] for col in order]
-        bits = [bit for bit in bits if bit]
-        created = self._sort_moves(bits, position, mask, tt_move, ply, depth)
-
-        best, best_move = -INF, 0
-        child_position = position ^ mask
-        for bit in bits:
-            child_theirs = created.get(bit)
-            if child_theirs is None:
-                child_theirs = self.winning_spots(position | bit, mask | bit)
-            score = -self.negamax(
-                child_position, mask | bit, depth - 1, -beta, -alpha, ply + 1,
-                their_spots & ~bit, child_theirs,
-            )
-            if score > best:
-                best, best_move = score, bit
-            if score > alpha:
-                alpha = score
+                    break
+            return best
+        best = INF
+        for _, child in _children(state, 1, moves):
+            best = min(best, self.search(child, depth - 1, alpha, beta, ply + 1))
+            beta = min(beta, best)
             if alpha >= beta:
-                self.killers[ply] = bit
                 break
-
-        if best <= alpha_start:
-            flag = _UPPER
-        elif best >= beta_start:
-            flag = _LOWER
-        else:
-            flag = _EXACT
-        self.table[key] = (depth, flag, best, best_move)
         return best
 
-    def _sort_moves(self, bits, position, mask, tt_move, ply, depth):
-        """Ordena `bits` en el lugar y devuelve las amenazas ya calculadas.
 
-        Cerca de la raiz conviene mirar cuantas amenazas crea cada jugada: son
-        pocos nodos y un buen orden poda muchisimo. Mas abajo el calculo no se
-        paga solo, y alcanza con la jugada de la tabla, la killer y el orden
-        del centro hacia afuera con el que ya vienen.
-        """
-        if len(bits) < 2:
-            return {}
+def best_direction(state, time_budget=TIME_BUDGET, max_depth=MAX_DEPTH):
+    """Mejor jugada para el jugador 0 dentro del presupuesto de tiempo."""
+    moves = legal_moves(state, 0)
+    if not moves or moves == [None]:
+        return DEFAULT_DIRECTION
+    ordered = _children(state, 0, moves)
+    best = ordered[0][0]
+    if len(ordered) == 1:
+        return best
 
-        if depth >= _ORDER_MIN_DEPTH:
-            killer = self.killers.get(ply, 0)
-            created = {
-                bit: self.winning_spots(position | bit, mask | bit)
-                for bit in bits
-            }
-
-            def rank(bit):
-                if bit == tt_move:
-                    return _ORDER_TT
-                if bit == killer:
-                    return _ORDER_KILLER
-                return _ORDER_THREAT * created[bit].bit_count()
-
-            bits.sort(key=rank, reverse=True)
-            return created
-
-        first = tt_move or self.killers.get(ply, 0)
-        if first in bits:
-            bits.insert(0, bits.pop(bits.index(first)))
-        return {}
-
-
-def best_column(grid, me, opponent=None, max_depth=MAX_DEPTH,
-                time_budget=TIME_BUDGET):
-    """Mejor columna segun negamax con profundizacion iterativa.
-
-    Una profundidad solo cuenta si se termino de explorar: si se corta por
-    reloj a mitad de camino, los puntajes no son comparables entre si (unos
-    salen de mirar mas lejos que otros) y vale el resultado de la anterior.
-    """
-    position, mask, geo = _to_bitboards(grid, me)
-    playable = (mask + geo.bottom) & geo.board
-    if not playable:
-        raise BoardError('no hay columnas disponibles')
-
-    moves = [
-        (col, playable & geo.column[col])
-        for col in geo.order
-        if playable & geo.column[col]
-    ]
-
-    # Ganar en el acto no necesita busqueda.
-    my_spots = _winning_spots(position, mask, geo)
-    for col, bit in moves:
-        if my_spots & bit:
-            return col
-
-    their_spots = _winning_spots(position ^ mask, mask, geo)
-    search = _Search(geo, time.monotonic() + time_budget)
-    child_position = position ^ mask
-    best = moves[0][0]
-    # Mas alla de las casillas que quedan libres no hay arbol que explorar: la
-    # ultima profundidad ya vio partidas terminadas y la respuesta es exacta.
-    max_depth = min(max_depth, (geo.board ^ mask).bit_count())
-    for depth in range(1, max_depth + 1):
-        chosen, alpha = None, -INF
+    searcher = _Searcher(time.perf_counter() + time_budget)
+    horizon = max(1, min(max_depth, state.plies_left))
+    for depth in range(1, horizon + 1):
+        scored = []
         try:
-            for col, bit in moves:
-                score = -search.negamax(
-                    child_position, mask | bit, depth - 1, -INF, -alpha, 1,
-                    their_spots & ~bit,
-                    _winning_spots(position | bit, mask | bit, geo),
-                )
-                if chosen is None or score > alpha:
-                    chosen, alpha = col, score
-        except _TimeUp:
+            alpha = -INF
+            for move, child in ordered:
+                value = searcher.search(child, depth - 1, alpha, INF, 1)
+                scored.append((value, move, child))
+                alpha = max(alpha, value)
+        except _Timeout:
+            # Si en la vuelta cortada algo ya supero a la mejor anterior
+            # (que se busca primero), vale mas que lo de la vuelta pasada.
+            if scored:
+                top = max(scored, key=lambda x: x[0])
+                if top[0] > scored[0][0]:
+                    best = top[1]
             break
-        best = chosen
-        # La proxima profundidad arranca por la mejor jugada de esta.
-        moves.sort(key=lambda item: item[0] != best)
-        if alpha >= WIN_SCORE - MAX_DEPTH:
-            break  # mate encontrado: mas profundidad no lo mejora
+        scored.sort(key=lambda x: x[0], reverse=True)
+        ordered = [(move, child) for _, move, child in scored]
+        best = ordered[0][0]
+        if abs(scored[0][0]) >= _DECIDED:
+            break
     return best
 
 
-def resolve_piece(grid, me):
-    """Con que ficha jugamos, chequeando lo que dice el server contra el tablero.
-
-    Si `side` no coincide con ninguna ficha puesta, tomarlo al pie de la letra
-    seria fatal: el motor veria todas las fichas como del rival y jugaria en
-    contra de si mismo. En ese caso se deduce por conteo, porque el que tiene
-    que mover es siempre el que tiene menos fichas puestas.
-    """
-    counts = {}
-    for row in grid:
-        for cell in row:
-            if cell != EMPTY:
-                counts[cell] = counts.get(cell, 0) + 1
-
-    if me in counts or len(counts) < 2:
-        # Con una sola ficha en juego el tablero es consistente: somos el que
-        # todavia no puso ninguna.
-        return me
-    return min(counts, key=lambda piece: (counts[piece], piece))
-
-
-def infer_opponent(grid, me):
-    """Ficha del rival, deducida del tablero. Cae en un placeholder al inicio."""
-    for row in grid:
-        for cell in row:
-            if cell != EMPTY and cell != me:
-                return cell
-    return '?' if me != '?' else '!'
-
-
-def choose_column(board_str, side, max_depth=MAX_DEPTH,
-                  time_budget=TIME_BUDGET):
-    """Columna a jugar. Nunca levanta: ante la duda juega la 0."""
+def choose_direction(turn_data, time_budget=TIME_BUDGET, max_depth=MAX_DEPTH):
+    """Punto de entrada: `turn_data` de un `your_turn` -> direccion."""
     try:
-        grid = parse_board(board_str)
-        me = resolve_piece(grid, (side or '').strip()[:1] or '?')
-        return best_column(
-            grid, me, infer_opponent(grid, me), max_depth, time_budget
-        )
-    except (BoardError, IndexError, TypeError) as e:
-        print('no pude leer el tablero ({}), juego la columna 0'.format(e))
-        return 0
+        state = build_state(turn_data)
+    except BoardError:
+        state = None
+    if state is None:
+        return DEFAULT_DIRECTION
+    return best_direction(state, time_budget, max_depth)

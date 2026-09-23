@@ -53,18 +53,44 @@ class InTempDirTestCase(HistoryTestCase):
         self.addCleanup(os.chdir, cwd)
 
 
-EMPTY_BOARD = '\n'.join(['.......'] * 6)
+# A arriba a la izquierda mirando a la derecha, B abajo, el 1 a la vista.
+BOARD = '\n'.join(
+    [
+        '|            |',
+        '| aaA   1    |',
+        '|            |',
+        '|     2   X  |',
+        '|            |',
+        '|  3      4  |',
+        '|            |',
+        '|     5      |',
+        '|            |',
+        '|   #######  |',
+        '|    Bbb     |',
+        '|            |',
+    ]
+)
 
 
-def your_turn(game_id='g1', board=EMPTY_BOARD, turn_token='tok', side='A'):
+def your_turn(game_id='g1', board=BOARD, turn_token='tok', side='A'):
     return json.dumps(
         {
             'event': 'your_turn',
             'data': {
                 'game_id': game_id,
                 'board': board,
+                'rows': 12,
+                'cols': 12,
+                'board_size': '12x12',
+                'remaining_moves': 300,
                 'turn_token': turn_token,
                 'side': side,
+                'player_1': 'a@x.com',
+                'score_1': 0,
+                'player_2': 'b@x.com',
+                'score_2': 0,
+                'multiplier_1': 1,
+                'multiplier_2': 1,
             },
         }
     )
@@ -122,23 +148,26 @@ class TestSend(unittest.TestCase):
 
 
 class TestProcessMove(HistoryTestCase):
-    def test_the_column_comes_from_the_strategy(self):
+    def test_the_direction_comes_from_the_strategy(self):
         ws = FakeWebSocket()
         request = json.loads(your_turn(side='A'))
 
-        with mock.patch('run.strategy.choose_column', return_value=5) as pick:
+        with mock.patch(
+            'run.strategy.choose_direction', return_value='left'
+        ) as pick:
             asyncio.run(run.process_move(ws, request))
 
-        pick.assert_called_once_with(EMPTY_BOARD, 'A')
-        self.assertEqual(ws.sent[0]['data']['col'], 5)
+        pick.assert_called_once_with(request['data'])
+        self.assertEqual(ws.sent[0]['action'], 'move')
+        self.assertEqual(ws.sent[0]['data']['direction'], 'left')
 
-    def test_it_opens_in_the_center_for_real(self):
-        """Sin mocks: el bot ya no juega al azar."""
+    def test_it_heads_for_the_food_for_real(self):
+        """Sin mocks: el 1 esta cuatro celdas a la derecha de la cabeza."""
         ws = FakeWebSocket()
 
         asyncio.run(run.process_move(ws, json.loads(your_turn())))
 
-        self.assertEqual(ws.sent[0]['data']['col'], 3)
+        self.assertEqual(ws.sent[0]['data']['direction'], 'right')
 
     def test_move_carries_the_turn_token(self):
         ws = FakeWebSocket()
@@ -259,17 +288,6 @@ class TestStart(unittest.TestCase):
 
         self.assertEqual(connect.call_count, 2)
         sleep.assert_called_once_with(3)
-
-
-class TestProcessWall(unittest.TestCase):
-    def test_wall_orientation_is_h_or_v(self):
-        ws = FakeWebSocket()
-        request = {'data': {'game_id': 'g1', 'turn_token': 'tok'}}
-
-        asyncio.run(run.process_wall(ws, request))
-
-        self.assertEqual(ws.sent_actions, ['wall'])
-        self.assertIn(ws.sent[0]['data']['orientation'], ('h', 'v'))
 
 
 class TestMain(unittest.TestCase):

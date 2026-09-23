@@ -3,8 +3,10 @@
 [![tests](https://github.com/marianoliceaga/codechallenge-bot/actions/workflows/tests.yml/badge.svg)](https://github.com/marianoliceaga/codechallenge-bot/actions/workflows/tests.yml)
 
 Bot cliente para [CodeChallenge](https://codechallenge.net.ar/). Se conecta por
-websocket a `wss://server.codechallenge.net.ar/ws`, acepta desafíos y juega su
-turno.
+websocket a `wss://server.codechallenge.net.ar/ws`, acepta desafíos y juega
+**Snake** de a dos, por turnos, con las reglas de
+[How to play](https://codechallenge-snake-production.up.railway.app/how-to-play)
+vigentes al 23 Sep 2026 (v5).
 
 ## Correrlo
 
@@ -55,7 +57,7 @@ Ver el estado en la pestaña
 | Archivo | Qué hace |
 | --- | --- |
 | `run.py` | El bot: conexión y loop de eventos. |
-| `strategy.py` | El motor de Connect 4: parseo del tablero y búsqueda. |
+| `strategy.py` | El motor de Snake: parseo del tablero, reglas y búsqueda. |
 | `test_run.py` | Tests del cliente, con un websocket falso (no toca la red). |
 | `test_strategy.py` | Tests del motor. |
 | `requirements.txt` | Dependencia de runtime (`websockets`). |
@@ -65,90 +67,48 @@ Ver el estado en la pestaña
 
 ## La estrategia
 
-`strategy.choose_column()` decide la jugada con **negamax + poda alpha-beta y
-profundización iterativa sobre bitboards**, o sea que mira una docena de
-jugadas hacia adelante en vez de tirar al azar:
+Cada `your_turn` se contesta con
 
-- gana si tiene el 4 en línea disponible, y prefiere ganar antes que bloquear;
-- bloquea la amenaza del rival;
-- no juega columnas que le dejen servida la victoria al rival en la fila de
-  arriba;
-- si no hay táctica, valora el centro, la cantidad de amenazas de cada lado y
-  la **paridad** de las filas donde caen (en Connect 4 al que abre la partida le
-  sirven las amenazas de las filas impares, y al segundo las pares).
+```json
+{"action": "move", "data": {"game_id": "...", "turn_token": "...", "direction": "up"}}
+```
 
-### Cómo hace para mirar tan lejos
+y `strategy.choose_direction(turn_data)` elige la dirección. Todo se lee del
+`board` (y de `rows`/`cols`, `remaining_moves`, `side`, `score_1/2` y
+`multiplier_1/2`): el tamaño cambia de partida en partida (12 a 20 por lado, no
+necesariamente cuadrado), así que nada está fijo en 15×15.
 
-El tablero se busca en **bitboards**: dos enteros de Python (mis fichas y todas
-las fichas) con un bit por celda y una fila centinela por columna, al estilo
-Fhourstones. Detectar los 4 en línea, listar jugadas y contar amenazas pasa a
-ser un puñado de shifts en vez de recorrer listas.
+### Las reglas que modela (v1 a v5)
 
-Encima de eso hay:
-
-| Técnica | Para qué |
+| Qué | Cómo lo toma el bot |
 | --- | --- |
-| Tabla de transposición | La misma posición se llega por muchos órdenes de jugadas; se calcula una sola vez. |
-| Killer moves + orden por amenazas | Probar primero las jugadas buenas hace que alpha-beta pode muchísimo antes. |
-| Amenazas heredadas del padre | Las máscaras de casillas ganadoras bajan como parámetro en vez de recalcularse en cada nodo. |
-| Podas exactas de Pascal Pons | Si el rival tiene **dos** amenazas jugables la posición ya está perdida, y jugar debajo de una casilla ganadora del rival también pierde. |
+| Chocar contra el borde, un cuerpo o el rival | Termina la partida y pierde el que choca: nunca lo elige mientras haya otra salida. |
+| Comida numerada `1`..`9` | Toca el dígito cuyo predecesor cíclico **no** está en el tablero (con `1 6 7 8 9` toca el 6, no el 1). El correcto vale `dígito × 100 × multiplicador` y hace crecer; otro cualquiera es -500 y lo esquiva. |
+| `X` | +50 y el multiplicador propio sube un escalón para siempre. Vale más cuanto antes se agarre. |
+| `#` | -500 y la víbora queda quieta, pero no termina la partida: si todo lo demás es chocar, pegarle al muro es la jugada que salva el partido. |
+| +1 por jugada y `remaining_moves` | La búsqueda no mira más allá del final; en la última jugada gana el que tiene más puntos. |
+| `*` (reglas viejas) | Se sigue entendiendo como comida de 100. |
 
-Las dos podas de Pons son exactas, no heurísticas: valen aunque la búsqueda se
-corte por profundidad. Por eso el motor encuentra mates forzados bastante más
-lejos que el límite nominal de la búsqueda (por ejemplo ve un mate a 5 jugadas
-buscando a profundidad 3).
+Se asume que el lado `A` es `player_1` (`score_1`, `multiplier_1`) y el `B`
+`player_2`. Cualquier símbolo desconocido se trata como obstáculo.
 
-Con esto, en los 1.5 s de `TIME_BUDGET` baja **10 plies en la apertura y 13 en
-el medio juego**, a unos 170.000 nodos por segundo; en el final resuelve la
-partida entera. La versión anterior, sobre listas de Python, llegaba a 6.
+### Cómo decide
 
-### Qué tan fuerte quedó
+**Minimax con poda alpha-beta y profundización iterativa**, cortada por reloj
+(`TIME_BUDGET = 1.0` s). Cada jugada se simula con las reglas de arriba, y el
+rival se supone el más molesto posible. Lo único que no se puede simular es lo
+que aparece al azar (el dígito nuevo, la `X` de reemplazo, el muro siguiente).
 
-| Medición | Resultado |
-| --- | --- |
-| Contra el motor anterior, mismo tiempo por jugada (20 partidas, alternando quién abre) | **17-3** |
-| Juego perfecto en tablero 4x4 (120 posiciones al azar contra un solucionador exacto por fuerza bruta) | 0 jugadas subóptimas |
-| Ídem 5x4, dándole tiempo para llegar al final de la partida | 0 jugadas subóptimas |
+En las hojas se evalúa:
 
-Ese último punto es el que más dice: en un tablero donde la búsqueda **llega
-hasta el final**, el motor juega perfecto, o sea que la búsqueda es correcta y
-lo único que lo separa del juego perfecto en 7x6 es el presupuesto de tiempo.
-El test `TestPlaysPerfectlyOnASmallBoard` deja esa comparación corriendo en
-cada CI.
+- la diferencia de puntaje y la de multiplicadores (cada escalón vale más
+  cuantas más jugadas quedan);
+- la **carrera por la comida**: quién llega primero al dígito que toca, y desde
+  ahí a los dos siguientes, así el que la pierde ya se acomoda para el próximo;
+- las `X` al alcance de cada uno;
+- el territorio (a qué celdas llega cada víbora antes que la otra) y si alguna
+  quedó encerrada en menos lugar que su largo. El BFS sabe que los cuerpos se
+  van liberando desde la cola.
 
-Un dato contraintuitivo que salió midiendo: probé una heurística de hojas más
-rica (contar las ventanas de 4 todavía vivas, como hacía la versión anterior) y
-**juega peor**, 6-14, porque evaluar sale caro y cuesta 3 plies de
-profundidad. En este juego la profundidad le gana a la evaluación, así que la
-heurística quedó deliberadamente barata.
-
-La búsqueda se corta por reloj (`TIME_BUDGET`, 1.5 s) para no perder el turno
-por timeout. Una profundidad solo se toma en cuenta si se terminó de explorar:
-si se corta a mitad de camino vale el resultado de la anterior, porque si no se
-estarían comparando puntajes que salen de mirar distinta cantidad de jugadas.
-
-Para ajustar la fuerza está `TIME_BUDGET`: es lo que más rinde, porque cada vez
-que se duplica el presupuesto entra aproximadamente un ply más de búsqueda.
-**Ojo al subirlo**: el server penaliza el turno vencido, y al presupuesto hay
-que descontarle la ida y vuelta por el websocket, así que conviene dejar
-margen contra el timeout real del server. Los pesos de la heurística son las
-constantes `SCORE_*`, y `MAX_DEPTH` es solo el techo (42, un tablero lleno).
-
-### Suposiciones sobre el tablero (verificar con una partida real)
-
-El formato exacto del string del tablero no está documentado, así que
-`parse_board()` es tolerante: acepta filas separadas por saltos de línea o por
-`|`, toma como celda vacía cualquiera de `.-_ 0*`, y **deduce sola** si la fila
-0 es la de arriba o la de abajo (en Connect 4 las fichas se apilan contra la
-gravedad, así que el propio tablero lo delata). Si no lo puede interpretar,
-avisa por consola y juega la columna 0.
-
-Lo único que no se puede deducir del todo es **con qué carácter se dibujan tus
-fichas**: se arranca del valor de `side` que manda el server, pero
-`resolve_piece()` lo cruza contra el tablero. Si `side` no coincide con ninguna
-ficha puesta (por ejemplo el server manda `"red"` y el tablero viene con `X` y
-`O`), se deduce por conteo: el que tiene que mover es siempre el que tiene
-menos fichas. Sin ese chequeo el motor vería todas las fichas como del rival y
-jugaría en contra de sí mismo, que es la única forma realista de que pierda.
-Igual, después de la primera partida real conviene mirar el `game_*.log` y
-confirmarlo.
+El tablero no dice en qué orden van los segmentos, así que el cuerpo se
+reconstruye buscando un camino desde la cabeza que pase por todas sus celdas.

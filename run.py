@@ -2,7 +2,6 @@ import asyncio
 import json
 import sys
 import time
-from random import randint
 
 import websockets
 
@@ -96,29 +95,15 @@ async def process_your_turn(websocket, request_data):
 
 
 async def process_move(websocket, request_data):
-    board = request_data['data']['board']
-    print(board)
+    turn_data = request_data['data']
+    print(turn_data['board'])
     move = {
-        'game_id': request_data['data']['game_id'],
-        'turn_token': request_data['data']['turn_token'],
-        'col': strategy.choose_column(board, request_data['data'].get('side')),
+        'game_id': turn_data['game_id'],
+        'turn_token': turn_data['turn_token'],
+        'direction': strategy.choose_direction(turn_data),
     }
     log_action(move['game_id'], {'action': 'move', 'data': move})
     await send(websocket, 'move', move)
-
-
-async def process_wall(websocket, request_data):
-    await send(
-        websocket,
-        'wall',
-        {
-            'game_id': request_data['data']['game_id'],
-            'turn_token': request_data['data']['turn_token'],
-            'row': randint(0, 8),
-            'col': randint(0, 8),
-            'orientation': 'h' if randint(0, 1) == 0 else 'v',
-        },
-    )
 
 
 def main(argv):
