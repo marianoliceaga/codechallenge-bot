@@ -6,7 +6,7 @@ Bot cliente para [CodeChallenge](https://codechallenge.net.ar/). Se conecta por
 websocket a `wss://server.codechallenge.net.ar/ws`, acepta desafíos y juega
 **Snake** de a dos, por turnos, con las reglas de
 [How to play](https://codechallenge-snake-production.up.railway.app/how-to-play)
-vigentes al 23 Sep 2026 (v5).
+vigentes al 30 Sep 2026 (v6).
 
 ## Correrlo
 
@@ -78,12 +78,13 @@ y `strategy.choose_direction(turn_data)` elige la dirección. Todo se lee del
 `multiplier_1/2`): el tamaño cambia de partida en partida (12 a 20 por lado, no
 necesariamente cuadrado), así que nada está fijo en 15×15.
 
-### Las reglas que modela (v1 a v5)
+### Las reglas que modela (v1 a v6)
 
 | Qué | Cómo lo toma el bot |
 | --- | --- |
 | Chocar contra el borde, un cuerpo o el rival | Termina la partida y pierde el que choca: nunca lo elige mientras haya otra salida. |
 | Comida numerada `1`..`9` | Toca el dígito cuyo predecesor cíclico **no** está en el tablero (con `1 6 7 8 9` toca el 6, no el 1). El correcto vale `dígito × 100 × multiplicador` y hace crecer; otro cualquiera es -500 y lo esquiva. |
+| Copias (v6) | Cada dígito está en 3 a 5 celdas. Va a la copia más cercana del que toca; comer una se lleva todas las demás, y una copia equivocada solo gasta esa (el server repone otra). |
 | `X` | +50 y el multiplicador propio sube un escalón para siempre. Vale más cuanto antes se agarre. |
 | `#` | -500 y la víbora queda quieta, pero no termina la partida: si todo lo demás es chocar, pegarle al muro es la jugada que salva el partido. |
 | +1 por jugada y `remaining_moves` | La búsqueda no mira más allá del final; en la última jugada gana el que tiene más puntos. |
@@ -103,9 +104,11 @@ En las hojas se evalúa:
 
 - la diferencia de puntaje y la de multiplicadores (cada escalón vale más
   cuantas más jugadas quedan);
-- la **carrera por la comida**: quién llega primero al dígito que toca, y desde
-  ahí a los dos siguientes, así el que la pierde ya se acomoda para el próximo;
-- las `X` al alcance de cada uno;
+- la **carrera por la comida**: quién llega primero a alguna copia del dígito
+  que toca, y desde ahí a los dos siguientes, así el que la pierde ya se
+  acomoda para el próximo;
+- las `X` al alcance de cada uno, repartidas según la ventaja en distancia (no
+  todo o nada: si no, pagaría penalidades por ganar un empate);
 - el territorio (a qué celdas llega cada víbora antes que la otra) y si alguna
   quedó encerrada en menos lugar que su largo. El BFS sabe que los cuerpos se
   van liberando desde la cola.
