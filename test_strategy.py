@@ -134,7 +134,7 @@ class TestBuildState(unittest.TestCase):
         s = state(self.ROWS)
 
         self.assertEqual((s.rows, s.cols), (4, 5))
-        self.assertEqual(s.digits, {1: 3, 2: 11})
+        self.assertEqual(s.digits, {1: (3,), 2: (11,)})
         self.assertEqual(s.target, 1)
         self.assertEqual(s.items, {7: 'X', 15: '*'})
         self.assertEqual(s.grid[9], strategy.WALL)
@@ -153,6 +153,12 @@ class TestBuildState(unittest.TestCase):
         self.assertEqual(s.scores, [0, 0])
         self.assertEqual(s.mults, [1, 1])
         self.assertEqual(s.plies_left, strategy.DEFAULT_REMAINING_MOVES)
+
+    def test_every_copy_of_a_digit_is_kept(self):
+        s = state(['aA1 2', '1   1', '2  bB'])
+
+        self.assertEqual(s.digits, {1: (2, 5, 9), 2: (4, 10)})
+        self.assertEqual(s.target, 1)
 
     def test_unknown_side_is_taken_as_a(self):
         self.assertEqual(state(self.ROWS, side='?').bodies[0], (0, 1))
@@ -254,6 +260,35 @@ class TestStep(unittest.TestCase):
         self.assertEqual(t.bodies[1], (14, 9))
         self.assertEqual(t.to_move, 0)
 
+    def test_eating_one_copy_of_the_target_takes_them_all(self):
+        s = state(['aA1 1', '  2  ', '1  2 ', '    B'])
+
+        t = strategy.step(s, 0, 'right')
+
+        self.assertEqual(t.scores[0], 1 + 100)
+        self.assertEqual(len(t.bodies[0]), 3)
+        self.assertNotIn(1, t.digits)
+        self.assertEqual(t.target, 2)
+        for cell in (4, 10):
+            self.assertEqual(t.grid[cell], strategy.EMPTY)
+        self.assertEqual(t.grid[2], strategy.SNAKE)
+        self.assertEqual(s.digits[1], (2, 4, 10))  # el original no cambia
+
+    def test_a_wrong_copy_only_uses_up_that_copy(self):
+        s = state(['aA2 2', '  1  ', '2    ', '    B'])
+
+        t = strategy.step(s, 0, 'right')
+
+        self.assertEqual(t.scores[0], 1 - 500)
+        self.assertEqual(t.digits[2], (4, 10))
+        self.assertEqual(t.target, 1)
+        self.assertEqual(len(t.bodies[0]), 2)
+
+    def test_the_last_known_wrong_copy_stays_in_the_sequence(self):
+        t = strategy.step(state(['aA2  ', '  1  ', '    B']), 0, 'right')
+
+        self.assertEqual(t.digits[2], (2,))
+
     def test_a_missing_snake_just_passes(self):
         s = state(['aA ', '   '])
 
@@ -320,6 +355,17 @@ class TestEvaluate(unittest.TestCase):
         boxed = state(['aA#     ', '###     ', '        ', 'B       '])
 
         self.assertLess(strategy.evaluate(boxed), strategy.evaluate(free) - 1000)
+
+    def test_the_race_for_an_x_is_not_all_or_nothing(self):
+        share = strategy._race_share
+
+        self.assertIsNone(share(-1, -1, True))
+        self.assertEqual(share(-1, 3, True), 0.0)
+        self.assertEqual(share(3, -1, False), 1.0)
+        self.assertGreater(share(3, 3, True), 0.5)
+        self.assertLess(share(3, 3, False), 0.5)
+        self.assertGreater(share(2, 8, False), 0.95)
+        self.assertLess(share(3, 4, False), share(3, 5, False))
 
     def test_final_score_is_a_win_a_loss_or_a_draw(self):
         s = state(['A ', ' B'])
@@ -487,6 +533,20 @@ class TestChooseDirection(unittest.TestCase):
         move = strategy.best_direction(s, time_budget=0)
 
         self.assertIn(move, strategy.legal_moves(s, 0))
+
+    def test_goes_for_the_nearest_copy_of_the_target(self):
+        rows = [
+            '         1',
+            '          ',
+            '  aaA     ',
+            '          ',
+            '    1     ',
+            '          ',
+            ' 2   3  4 ',
+            '5     1 bB',
+        ]
+
+        self.assertEqual(choose(rows), 'down')
 
     def test_the_search_stops_at_the_end_of_the_game(self):
         # Queda una sola jugada: comer el 1 gana la partida por puntos.

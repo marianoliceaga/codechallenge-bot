@@ -1,4 +1,4 @@
-"""Motor de juego para Snake (reglas v5 de CodeChallenge, 23 Sep 2026).
+"""Motor de juego para Snake (reglas v6 de CodeChallenge, 30 Sep 2026).
 
 Dos viboras, una por jugador, que mueven por turnos. El server manda el tablero
 como string (filas envueltas en `|...|` y unidas por saltos de linea) y espera
@@ -12,7 +12,9 @@ Lo que hay en el tablero y lo que vale:
   del 9 viene el 1) y hay que comerlos en orden. El que toca es el que no tiene
   a su predecesor en el tablero (con `1 6 7 8 9` toca el 6, no el 1). El
   correcto vale `digito * 100 * multiplicador` y hace crecer; cualquier otro
-  es -500.
+  es -500. Desde la v6 cada digito esta en 3 a 5 copias: comer una copia del
+  que toca se lleva todas las demas, y comer una copia equivocada solo gasta
+  esa (el server repone otra en algun lado).
 - `X`: +50 y el multiplicador propio sube un escalon para siempre. No crece.
 - `#`: muro que se achica cada ronda. Pegarle es -500 y la vibora se queda
   quieta, pero la partida sigue (a veces es la unica salida que no mata).
@@ -37,6 +39,7 @@ evalua:
   se van liberando desde la cola.
 """
 
+import math
 import time
 
 DIRECTIONS = {
@@ -81,6 +84,7 @@ FOOD_CHAIN = 3              # cuantos digitos de la secuencia mira la carrera
 TERRITORY_WEIGHT = 1        # por celda de territorio
 TRAPPED = 5000              # encerrado en menos lugar que el propio largo
 TRAPPED_PER_CELL = 200
+RACE_SOFTNESS = 1.5         # cuanto pesa un paso de ventaja en la carrera por una X
 
 
 class BoardError(ValueError):
@@ -214,7 +218,8 @@ def _as_int(value, default):
 class State:
     """Una posicion. El jugador 0 es el bot y el 1 el rival.
 
-    `bodies` van de la cola a la cabeza. `digits` e `items` (las `X` y `*`) se
+    `bodies` van de la cola a la cabeza. `digits` va de cada digito a la tupla
+    de celdas donde estan sus copias. `digits` e `items` (las `X` y `*`) se
     comparten entre estados y solo se copian cuando alguien come.
     """
 
@@ -289,7 +294,7 @@ def build_state(turn_data):
                 body_cells[ch.upper()].add(i)
                 grid.append(SNAKE)
             elif ch in DIGITS:
-                digits.setdefault(int(ch), i)
+                digits.setdefault(int(ch), []).append(i)
                 grid.append(ch)
             elif ch in (MULTIPLIER, STAR):
                 items[i] = ch
@@ -316,6 +321,7 @@ def build_state(turn_data):
     mults = [max(1, _as_int(turn_data.get('multiplier_' + n), 1)) for n in numbers]
     plies_left = _as_int(turn_data.get('remaining_moves'), DEFAULT_REMAINING_MOVES)
 
+    digits = {d: tuple(cells) for d, cells in digits.items()}
     return State(rows, cols, grid, bodies, scores, mults, digits, items,
                  target_digit(digits), max(1, plies_left))
 
@@ -355,18 +361,24 @@ def step(state, player, direction):
     grow = False
     if cell in DIGITS:
         digit = int(cell)
+        s.digits = dict(state.digits)
         if digit == state.target:
-            s.digits = dict(state.digits)
-            s.digits.pop(digit, None)
+            # Comer una copia se lleva todas las del mismo digito.
+            for copy in s.digits.pop(digit, ()):
+                s.grid[copy] = EMPTY
             s.scores[player] += digit * FOOD_POINTS * state.mults[player]
             grow = True
             following = next_digit(digit)
             s.target = following if following in s.digits else None
         else:
-            # El server lo vuelve a poner en otro lado. No sabemos donde, asi
-            # que sigue en la secuencia con su celda vieja: si desapareciera,
-            # comerlo "cortaria" la carrera y pareceria negocio.
+            # Solo se gasta esa copia y el server repone otra en algun lado.
+            # No sabemos donde, asi que si era la ultima copia conocida queda
+            # con su celda vieja: si el digito desapareciera, comerlo
+            # "cortaria" la carrera y pareceria negocio.
             s.scores[player] -= PENALTY
+            rest = tuple(c for c in state.digits.get(digit, ()) if c != dest)
+            if rest:
+                s.digits[digit] = rest
     elif cell == MULTIPLIER or cell == STAR:
         s.items = dict(state.items)
         s.items.pop(dest, None)
@@ -403,10 +415,20 @@ def legal_moves(state, player):
     return moves
 
 
+def _manhattan(a, b, cols):
+    ar, ac = divmod(a, cols)
+    br, bc = divmod(b, cols)
+    return abs(ar - br) + abs(ac - bc)
+
+
 def _goal(state, player):
     """Hacia donde conviene ir a ojo, para ordenar las jugadas."""
-    if state.target is not None and state.target in state.digits:
-        return state.digits[state.target]
+    copies = state.digits.get(state.target, ())
+    if copies:
+        head = state.head(player)
+        if head is None:
+            return copies[0]
+        return min(copies, key=lambda c: _manhattan(head, c, state.cols))
     for cell in state.items:
         return cell
     return None
@@ -423,9 +445,7 @@ def _children(state, player, moves):
         key = child.scores[player] - before
         head = child.head(player)
         if goal is not None and head is not None:
-            hr, hc = divmod(head, cols)
-            gr, gc = divmod(goal, cols)
-            key -= abs(hr - gr) + abs(hc - gc)
+            key -= _manhattan(head, goal, cols)
         scored.append((key, move, child))
     scored.sort(key=lambda x: x[0], reverse=True)
     return [(move, child) for _, move, child in scored]
@@ -502,10 +522,10 @@ def _trapped(area, length):
 def _food_race(state, d0, d1, my_turn):
     """Valor esperado de los proximos digitos de la secuencia para el bot.
 
-    La carrera se juega en orden: el que llega primero al digito que toca se lo
-    come y sale desde ahi (a ojo, en distancia Manhattan) hacia el siguiente;
-    el otro se va acercando al siguiente, pero no lo puede comer antes de que
-    le toque.
+    La carrera se juega en orden: el que llega primero a alguna copia del
+    digito que toca se lo come y sale desde esa copia (a ojo, en distancia
+    Manhattan) hacia la copia mas cercana del siguiente; el otro se va
+    acercando al siguiente, pero no lo puede comer antes de que le toque.
     """
     if state.target is None:
         return 0
@@ -517,34 +537,50 @@ def _food_race(state, d0, d1, my_turn):
     value = 0.0
     digit = state.target
     for _ in range(FOOD_CHAIN):
-        cell = state.digits.get(digit)
-        if cell is None:
+        copies = state.digits.get(digit)
+        if not copies:
             break
         arrival = []
         for p in (0, 1):
-            if origin[p] is None:
-                a = dist[p][cell]
-                if a < 0:
-                    arrival.append(None)
-                    continue
-            else:
-                r, c = divmod(origin[p], cols)
-                cr, cc = divmod(cell, cols)
-                a = clock[p] + abs(r - cr) + abs(c - cc)
-            arrival.append(max(a, ready + 1))
+            best = None
+            for cell in copies:
+                if origin[p] is None:
+                    a = dist[p][cell]
+                    if a < 0:
+                        continue
+                else:
+                    a = clock[p] + _manhattan(origin[p], cell, cols)
+                if best is None or a < best[0]:
+                    best = (a, cell)
+            arrival.append(None if best is None else (max(best[0], ready + 1), best[1]))
         a0, a1 = arrival
         if a0 is None and a1 is None:
             break
-        if a1 is None or (a0 is not None and (a0 < a1 or (a0 == a1 and my_turn))):
-            winner, steps = 0, a0
+        if a1 is None or (a0 is not None and (a0[0] < a1[0] or (a0[0] == a1[0] and my_turn))):
+            winner, (steps, cell) = 0, a0
         else:
-            winner, steps = 1, a1
+            winner, (steps, cell) = 1, a1
         points = digit * FOOD_POINTS * state.mults[winner] * GAMMA ** steps
         value += points if winner == 0 else -points
         origin[winner] = cell
         clock[winner] = ready = steps
         digit = next_digit(digit)
     return value
+
+
+def _race_share(a, b, my_turn):
+    """Que parte de una X se lleva el bot segun las distancias de cada uno.
+
+    No es todo o nada: con un paso de diferencia el que esta detras todavia
+    tiene chances, y si fuera todo o nada el bot pagaria penalidades por ganar
+    un empate. None si no llega ninguno.
+    """
+    if a < 0:
+        return None if b < 0 else 0.0
+    if b < 0:
+        return 1.0
+    edge = b - a + (0.5 if my_turn else -0.5)
+    return 1 / (1 + math.exp(-edge / RACE_SOFTNESS))
 
 
 def final_score(state):
@@ -563,31 +599,26 @@ def evaluate(state):
     d0, area0 = dist[0]
     d1, area1 = dist[1]
     my_turn = state.to_move == 0
-    sign = (1, -1)
 
     value = state.scores[0] - state.scores[1]
     mult_value = MULT_VALUE_PER_MOVE * state.plies_left / 2
     value += (state.mults[0] - state.mults[1]) * mult_value
 
-    def first(cell):
-        a, b = d0[cell], d1[cell]
-        if a >= 0 and (b < 0 or a < b or (a == b and my_turn)):
-            return 0, a
-        if b >= 0:
-            return 1, b
-        return None, 0
-
     value += _food_race(state, d0, d1, my_turn)
 
     for cell, ch in state.items.items():
-        winner, steps = first(cell)
-        if winner is None:
+        a, b = d0[cell], d1[cell]
+        share = _race_share(a, b, my_turn)
+        if share is None:
             continue
         if ch == MULTIPLIER:
-            gain = MULTIPLIER_POINTS + mult_value
+            gains = (MULTIPLIER_POINTS + mult_value,) * 2
         else:
-            gain = FOOD_POINTS * state.mults[winner]
-        value += sign[winner] * gain * GAMMA ** steps
+            gains = (FOOD_POINTS * state.mults[0], FOOD_POINTS * state.mults[1])
+        if share > 0:
+            value += share * gains[0] * GAMMA ** a
+        if share < 1:
+            value -= (1 - share) * gains[1] * GAMMA ** b
 
     mine = theirs = 0
     for a, b in zip(d0, d1):
