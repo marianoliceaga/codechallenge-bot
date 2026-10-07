@@ -9,6 +9,10 @@ from strategy import BoardError
 FAST = 0.3
 
 
+TAIL_A = '\u24b6'   # comida de cola que solo come A
+TAIL_B = '\u24b7'   # comida de cola que solo come B
+
+
 def board(*rows):
     return '\n'.join('|' + row + '|' for row in rows)
 
@@ -174,6 +178,21 @@ class TestBuildState(unittest.TestCase):
     def test_without_my_head_there_is_no_state(self):
         self.assertIsNone(state(['  ', ' B']))
 
+    def test_tail_food_belongs_to_the_snake_whose_letter_it_has(self):
+        s = state(['aA' + TAIL_A + TAIL_B, '   B'])
+
+        self.assertEqual(s.items, {2: 'tail0', 3: 'tail1'})
+        self.assertEqual(s.grid[2], 'tail0')
+
+        s = state(['aA' + TAIL_A + TAIL_B, '   B'], side='B')
+
+        self.assertEqual(s.items, {2: 'tail1', 3: 'tail0'})
+
+    def test_tail_food_on_the_board_means_its_shedder_already_crashed(self):
+        s = state(['aA' + TAIL_B + ' ', '   B'])
+
+        self.assertEqual(s.has_crashed, [True, False])
+
     def test_the_opponent_may_be_missing(self):
         self.assertEqual(state(['A ', '  ']).bodies[1], ())
 
@@ -234,23 +253,74 @@ class TestStep(unittest.TestCase):
         self.assertEqual(t.scores[0], 1 + 300)
         self.assertEqual(len(t.bodies[0]), 3)
 
-    def test_hitting_the_wall_costs_500_and_the_snake_stays(self):
-        s = state(['aA#  ', '    B'])
+    def test_the_first_crash_wipes_a_positive_score_and_sheds_the_tail(self):
+        # El ejemplo del reglamento, contra un muro: 1200 -> 0, no 700.
+        s = state(['aaaaaA#', '      B'], score_1=1200)
 
         t = strategy.step(s, 0, 'right')
 
-        self.assertEqual(t.scores[0], -500)
+        self.assertEqual(t.scores[0], 0)
+        self.assertEqual(t.bodies[0], (3, 4, 5))       # cabeza + 2, quieta
+        for cell in (0, 1, 2):
+            self.assertEqual(t.grid[cell], 'tail1')    # comida para el rival
+            self.assertEqual(t.items[cell], 'tail1')
+        self.assertEqual(t.has_crashed, [True, False])
+        self.assertIsNone(t.lost)
+        self.assertEqual(s.bodies[0], (0, 1, 2, 3, 4, 5))  # el original no cambia
+
+    def test_later_crashes_cost_500(self):
+        s = state(['aA#', '  B'], score_1=400)
+        s.has_crashed = [True, False]
+
+        self.assertEqual(strategy.step(s, 0, 'right').scores[0], -100)
+
+    def test_crashing_never_clears_a_negative_score(self):
+        t = strategy.step(state(['aA#', '  B'], score_1=-200), 0, 'right')
+
+        self.assertEqual(t.scores[0], -700)
+        self.assertTrue(t.has_crashed[0])
+
+    def test_a_short_snake_loses_nothing(self):
+        s = state(['aaA', '  B'])
+
+        t = strategy.step(s, 0, 'right')
+
         self.assertEqual(t.bodies[0], s.bodies[0])
-        self.assertIsNone(t.crashed)
+        self.assertEqual(t.items, {})
 
-    def test_leaving_the_board_is_a_crash(self):
-        self.assertEqual(strategy.step(state(['aA', ' B']), 0, 'right').crashed, 0)
+    def test_leaving_the_board_and_bodies_are_crashes_too(self):
+        s = state(['aA ', ' b ', ' B '], score_1=50)
 
-    def test_running_into_a_body_is_a_crash(self):
-        s = state(['aA ', ' b ', ' B '])
+        for move in ('up', 'down', 'left'):
+            t = strategy.step(s, 0, move)
+            self.assertEqual(t.scores[0], 0, move)
+            self.assertEqual(t.bodies[0], s.bodies[0], move)
 
-        self.assertEqual(strategy.step(s, 0, 'down').crashed, 0)
-        self.assertEqual(strategy.step(s, 0, 'left').crashed, 0)
+    def test_falling_below_minus_2500_loses(self):
+        s = state(['aA#', '  B'], score_1=-2200)
+
+        self.assertEqual(strategy.step(s, 0, 'right').lost, 0)
+
+        t = strategy.step(state(['aA2  ', '  1  ', '    B'], score_1=-2100), 0, 'right')
+        self.assertEqual(t.lost, 0)
+
+    def test_tail_food_feeds_only_its_owner(self):
+        s = state(['aA' + TAIL_A + '  ', '    B'], mult_1=3)
+
+        t = strategy.step(s, 0, 'right')
+
+        self.assertEqual(t.scores[0], 1 + 300)
+        self.assertEqual(len(t.bodies[0]), 3)
+        self.assertEqual(t.items, {})
+
+    def test_stepping_on_your_own_shed_tail_just_clears_it(self):
+        s = state(['aA' + TAIL_B + '  ', '    B'])
+
+        t = strategy.step(s, 0, 'right')
+
+        self.assertEqual(t.scores[0], 1)
+        self.assertEqual(len(t.bodies[0]), 2)
+        self.assertEqual(t.items, {})
 
     def test_the_opponent_moves_too(self):
         s = state(['aA   ', '     ', '   bB'])
@@ -299,10 +369,15 @@ class TestStep(unittest.TestCase):
 
 
 class TestLegalMoves(unittest.TestCase):
-    def test_crashes_are_left_out_but_the_wall_is_not(self):
+    def test_walls_and_bodies_are_left_out(self):
+        s = state(['aA#', '   ', '  B'])
+
+        self.assertEqual(strategy.legal_moves(s, 0), ['down'])
+
+    def test_with_no_way_out_a_single_crash_is_offered(self):
         s = state(['aA#', ' b ', ' B '])
 
-        self.assertEqual(strategy.legal_moves(s, 0), ['right'])
+        self.assertEqual(strategy.legal_moves(s, 0), [strategy.DEFAULT_DIRECTION])
 
     def test_missing_snake_can_only_pass(self):
         self.assertEqual(strategy.legal_moves(state(['A ', '  ']), 1), [None])
@@ -350,11 +425,24 @@ class TestEvaluate(unittest.TestCase):
             strategy.evaluate(state(rows)),
         )
 
-    def test_being_boxed_in_is_terrible(self):
-        free = state([' aA     ', '        ', '        ', 'B       '])
-        boxed = state(['aA#     ', '###     ', '        ', 'B       '])
+    def test_being_boxed_in_costs_what_the_crash_would(self):
+        free = state([' aA     ', '        ', '        ', 'B       '], score_1=2000)
+        boxed = state(['aA#     ', '###     ', '        ', 'B       '], score_1=2000)
 
-        self.assertLess(strategy.evaluate(boxed), strategy.evaluate(free) - 1000)
+        self.assertLess(strategy.evaluate(boxed), strategy.evaluate(free) - 2000)
+
+    def test_a_crash_after_the_first_is_cheaper(self):
+        s = state(['aaaaA', '     ', '    B'], score_1=3000)
+
+        self.assertEqual(strategy.crash_cost(s, 0), 3000 + 0.5 * 2 * 100)
+        s.has_crashed = [True, False]
+        self.assertEqual(strategy.crash_cost(s, 0), 500 + 0.5 * 2 * 100)
+
+    def test_tail_food_is_worth_something_only_to_its_owner(self):
+        mine = state(['aA ' + TAIL_A, '     ', '    B'])
+        theirs = state(['aA ' + TAIL_B, '     ', '    B'])
+
+        self.assertGreater(strategy.evaluate(mine), strategy.evaluate(theirs))
 
     def test_the_race_for_an_x_is_not_all_or_nothing(self):
         share = strategy._race_share
@@ -442,17 +530,27 @@ class TestChooseDirection(unittest.TestCase):
 
         self.assertIn(choose(rows), ('up', 'down'))
 
-    def test_bumping_the_wall_beats_crashing(self):
-        # Arriba el borde, abajo y atras el propio cuerpo: el muro es la
-        # unica jugada que no pierde la partida.
+    def test_eats_its_tail_food(self):
         rows = [
-            'aA#  ',
-            'aa   ',
-            '     ',
-            '    B',
+            '        ',
+            ' aaA' + TAIL_A + '   ',
+            '        ',
+            '       B',
         ]
 
         self.assertEqual(choose(rows), 'right')
+
+    def test_keeps_a_big_score_away_from_a_dead_end(self):
+        # Con 5000 puntos, el primer choque los borra: ni se acerca al bolsillo.
+        rows = [
+            '     ###',
+            'aaaaA  #',
+            '     ###',
+            '        ',
+            '       B',
+        ]
+
+        self.assertIn(choose(rows, score_1=5000), ('up', 'down'))
 
     def test_does_not_walk_into_a_dead_end(self):
         # A la derecha hay un bolsillo de dos celdas: entrar es chocar.
@@ -519,6 +617,15 @@ class TestChooseDirection(unittest.TestCase):
 
         self.assertIn(choose(rows), strategy.DIRECTIONS)
 
+    def test_when_every_move_crashes_it_still_answers(self):
+        rows = [
+            'aA#',
+            'ab ',
+            ' B ',
+        ]
+
+        self.assertIn(choose(rows), strategy.DIRECTIONS)
+
     def test_a_board_without_my_snake_gets_the_default(self):
         self.assertEqual(choose(['   ', ' B ']), strategy.DEFAULT_DIRECTION)
 
@@ -558,6 +665,66 @@ class TestChooseDirection(unittest.TestCase):
         ]
 
         self.assertEqual(choose(rows, remaining=1, score_2=50), 'right')
+
+
+class TestCrashMemory(unittest.TestCase):
+    """El server no dice quien ya choco: se deduce turno a turno."""
+
+    def setUp(self):
+        self.addCleanup(strategy.forget_game, 'g1')
+
+    def turn(self, rows, **kwargs):
+        data = turn(rows, **kwargs)
+        data['game_id'] = 'g1'
+        return data
+
+    def remember(self, rows, **kwargs):
+        data = self.turn(rows, **kwargs)
+        return strategy._remember(data, strategy.build_state(data))
+
+    def test_nobody_has_crashed_at_the_start(self):
+        self.assertEqual(self.remember(['aA  ', '  bB']), [False, False])
+
+    def test_a_head_that_did_not_move_and_lost_points_crashed(self):
+        self.remember([' aA ', '    ', '  bB'], score_1=800, score_2=300)
+        crashed = self.remember([' aA ', '    ', ' bB '], score_1=0, score_2=301)
+
+        self.assertEqual(crashed, [True, False])
+
+    def test_the_opponent_crashing_is_noticed_too(self):
+        self.remember(['aA  ', '    ', '  bB'], score_2=300)
+        crashed = self.remember([' aA ', '    ', '  bB'], score_1=1, score_2=0)
+
+        self.assertEqual(crashed, [False, True])
+
+    def test_it_is_remembered_for_the_rest_of_the_game(self):
+        self.remember([' aA ', '    ', '  bB'], score_1=800)
+        self.remember([' aA ', '    ', ' bB '], score_1=0)
+        crashed = self.remember(['  aA', '    ', 'bB  '], score_1=1)
+
+        self.assertEqual(crashed, [True, False])
+
+    def test_forgetting_a_game_starts_over(self):
+        self.remember([' aA ', '    ', '  bB'], score_1=800)
+        self.remember([' aA ', '    ', ' bB '], score_1=0)
+        strategy.forget_game('g1')
+
+        self.assertEqual(self.remember(['  aA', '    ', 'bB  ']), [False, False])
+
+    def test_without_a_game_id_only_the_board_counts(self):
+        data = turn(['aA' + TAIL_B, '  B'])
+
+        self.assertEqual(
+            strategy._remember(data, strategy.build_state(data)), [True, False]
+        )
+
+    def test_choose_direction_uses_the_memory(self):
+        self.remember([' aA ', '    ', '  bB'], score_1=800)
+        strategy.choose_direction(
+            self.turn([' aA ', '    ', ' bB '], score_1=0), time_budget=0.05
+        )
+
+        self.assertEqual(strategy._GAMES['g1']['crashed'], (True, False))
 
 
 if __name__ == '__main__':
