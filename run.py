@@ -71,6 +71,7 @@ async def play(websocket):
                 if game_id:
                     log_event(game_id, request_data)
                     write_game_log(game_id)
+                    strategy.forget_game(game_id)
             if request_data['event'] == 'challenge':
                 await send(
                     websocket,

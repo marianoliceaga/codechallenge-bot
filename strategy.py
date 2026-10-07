@@ -1,4 +1,4 @@
-"""Motor de juego para Snake (reglas v6 de CodeChallenge, 30 Sep 2026).
+"""Motor de juego para Snake (reglas v7 de CodeChallenge, 7 Oct 2026).
 
 Dos viboras, una por jugador, que mueven por turnos. El server manda el tablero
 como string (filas envueltas en `|...|` y unidas por saltos de linea) y espera
@@ -6,8 +6,15 @@ de vuelta una direccion: `up`, `down`, `left` o `right`.
 
 Lo que hay en el tablero y lo que vale:
 
-- `A`/`B` cabezas, `a`/`b` cuerpos. Chocar contra el borde, un cuerpo o la
-  otra vibora termina la partida: el que choca pierde.
+- `A`/`B` cabezas, `a`/`b` cuerpos.
+- Chocar (contra el borde, un cuerpo propio o ajeno, o un muro `#`) ya no
+  termina la partida (v7): la vibora no se mueve, se queda con la cabeza y dos
+  celdas, y el resto del cuerpo queda como comida de cola que solo puede comer
+  el rival. El primer choque deja el puntaje en 0 (si era positivo; si no,
+  -500) y los siguientes son -500. El que baja de -2500 pierde.
+- Comida de cola (U+24B6 / U+24B7, una A o una B en un circulo): la letra dice
+  quien la puede comer. Vale `100 * multiplicador` y hace crecer; el otro la
+  puede pisar para borrarla (sin puntos), que sirve para negarsela.
 - Comida numerada `1`..`9`: hay cinco digitos consecutivos (ciclicos, despues
   del 9 viene el 1) y hay que comerlos en orden. El que toca es el que no tiene
   a su predecesor en el tablero (con `1 6 7 8 9` toca el 6, no el 1). El
@@ -16,11 +23,10 @@ Lo que hay en el tablero y lo que vale:
   que toca se lleva todas las demas, y comer una copia equivocada solo gasta
   esa (el server repone otra en algun lado).
 - `X`: +50 y el multiplicador propio sube un escalon para siempre. No crece.
-- `#`: muro que se achica cada ronda. Pegarle es -500 y la vibora se queda
-  quieta, pero la partida sigue (a veces es la unica salida que no mata).
-- Cada movimiento que sobrevive suma +1. Si nadie choca, gana el que tiene mas
-  puntos cuando se acaban los `remaining_moves` (cuentan las jugadas de los
-  dos).
+- `#`: muro que se achica cada ronda. Pegarle es un choque.
+- Cada movimiento que no choca suma +1. Gana el que tiene mas puntos cuando se
+  acaban los `remaining_moves` (cuentan las jugadas de los dos; desde la v7 son
+  400).
 - `*` es la comida de las reglas viejas (+100); se sigue entendiendo por las
   dudas.
 
@@ -33,10 +39,15 @@ evalua:
   jugadas que quedan;
 - la carrera por la comida: quien llega primero al digito que toca, y el que
   la pierde se acomoda cerca del siguiente;
-- las `X` al alcance de cada uno;
+- las `X` y la comida de cola al alcance de cada uno;
 - el territorio (celdas a las que cada vibora llega antes) y si alguna quedo
-  encerrada en menos lugar que su largo. Para eso el BFS sabe que los cuerpos
-  se van liberando desde la cola.
+  encerrada en menos lugar que su largo, que la va a llevar a chocar: cuesta lo
+  que costaria ese choque. Para eso el BFS sabe que los cuerpos se van
+  liberando desde la cola.
+
+El server no dice si una vibora ya choco, y el primer choque es el que borra el
+puntaje, asi que `choose_direction` lo recuerda por partida: si una cabeza no
+se movio entre dos turnos y su puntaje bajo, esa vibora choco.
 """
 
 import math
@@ -57,6 +68,9 @@ WALL = '#'
 MULTIPLIER = 'X'
 STAR = '*'
 SNAKE = 's'
+# Comida de cola en la grilla normalizada: la puede comer el jugador 0 / el 1.
+TAIL_FOOD = ('tail0', 'tail1')
+TAIL_CHARS = {'\u24b6': 'A', '\u24b7': 'B'}   # A / B en un circulo: quien la come
 DIGITS = frozenset('123456789')
 EMPTY_CHARS = frozenset(' .')
 _BORDER_CHARS = frozenset('+-=')
@@ -66,7 +80,9 @@ MOVE_POINTS = 1
 FOOD_POINTS = 100
 MULTIPLIER_POINTS = 50
 PENALTY = 500
-DEFAULT_REMAINING_MOVES = 300
+DEFAULT_REMAINING_MOVES = 400
+KEPT_AFTER_CRASH = 3        # cabeza + 2: lo que queda despues de chocar
+LOSING_SCORE = -2500        # por debajo de esto la partida esta perdida
 
 # La busqueda se corta por reloj. Al presupuesto hay que descontarle la ida y
 # vuelta por el websocket: el server no espera para siempre.
@@ -82,8 +98,9 @@ GAMMA = 0.9                 # descuento por cada paso hasta un objetivo
 MULT_VALUE_PER_MOVE = 10    # cuanto rinde un escalon de multiplicador por jugada
 FOOD_CHAIN = 3              # cuantos digitos de la secuencia mira la carrera
 TERRITORY_WEIGHT = 1        # por celda de territorio
-TRAPPED = 5000              # encerrado en menos lugar que el propio largo
-TRAPPED_PER_CELL = 200
+TRAPPED = 300               # encerrado: ademas de lo que cuesta el choque
+TRAPPED_PER_CELL = 50
+SHED_FOOD_SHARE = 0.5       # cuanto de la cola que suelta un choque se come el rival
 RACE_SOFTNESS = 1.5         # cuanto pesa un paso de ventaja en la carrera por una X
 
 
@@ -219,17 +236,21 @@ class State:
     """Una posicion. El jugador 0 es el bot y el 1 el rival.
 
     `bodies` van de la cola a la cabeza. `digits` va de cada digito a la tupla
-    de celdas donde estan sus copias. `digits` e `items` (las `X` y `*`) se
-    comparten entre estados y solo se copian cuando alguien come.
+    de celdas donde estan sus copias. `items` tiene las `X`, las `*` y la
+    comida de cola. `digits` e `items` se comparten entre estados y solo se
+    copian cuando alguien come. `has_crashed` dice si cada uno ya choco alguna
+    vez (el primer choque es el que borra el puntaje) y `lost` quien bajo de
+    -2500, si alguno.
     """
 
     __slots__ = ('rows', 'cols', 'grid', 'bodies', 'scores', 'mults',
                  'digits', 'items', 'target', 'plies_left', 'to_move',
-                 'crashed')
+                 'has_crashed', 'lost')
 
     def __init__(self, rows, cols, grid, bodies, scores=(0, 0), mults=(1, 1),
                  digits=None, items=None, target=None,
-                 plies_left=DEFAULT_REMAINING_MOVES, to_move=0):
+                 plies_left=DEFAULT_REMAINING_MOVES, to_move=0,
+                 has_crashed=(False, False)):
         self.rows = rows
         self.cols = cols
         self.grid = list(grid)
@@ -241,7 +262,8 @@ class State:
         self.target = target
         self.plies_left = plies_left
         self.to_move = to_move
-        self.crashed = None
+        self.has_crashed = list(has_crashed)
+        self.lost = None
 
     def copy(self):
         s = State.__new__(State)
@@ -256,7 +278,8 @@ class State:
         s.target = self.target
         s.plies_left = self.plies_left
         s.to_move = self.to_move
-        s.crashed = self.crashed
+        s.has_crashed = self.has_crashed[:]
+        s.lost = self.lost
         return s
 
     def head(self, player):
@@ -264,11 +287,13 @@ class State:
         return body[-1] if body else None
 
 
-def build_state(turn_data):
+def build_state(turn_data, has_crashed=(False, False)):
     """Arma el `State` a partir del `turn_data` de un `your_turn`.
 
     Devuelve None si en el tablero no esta la cabeza propia. Se asume que el
     lado `A` es `player_1` (`score_1`, `multiplier_1`) y el `B` `player_2`.
+    `has_crashed` (bot, rival) viene de lo que se recuerda de turnos anteriores;
+    ademas, si hay comida de cola en el tablero, el que la solto ya choco.
     """
     rows_text = parse_board(turn_data.get('board'),
                             _as_int(turn_data.get('cols'), None))
@@ -299,6 +324,10 @@ def build_state(turn_data):
             elif ch in (MULTIPLIER, STAR):
                 items[i] = ch
                 grid.append(ch)
+            elif ch in TAIL_CHARS:
+                food = TAIL_FOOD[sides.index(TAIL_CHARS[ch])]
+                items[i] = food
+                grid.append(food)
             elif ch in EMPTY_CHARS:
                 grid.append(EMPTY)
             else:
@@ -321,9 +350,14 @@ def build_state(turn_data):
     mults = [max(1, _as_int(turn_data.get('multiplier_' + n), 1)) for n in numbers]
     plies_left = _as_int(turn_data.get('remaining_moves'), DEFAULT_REMAINING_MOVES)
 
+    crashed = list(has_crashed)
+    for food in items.values():
+        if food in TAIL_FOOD:
+            crashed[1 - TAIL_FOOD.index(food)] = True
+
     digits = {d: tuple(cells) for d, cells in digits.items()}
     return State(rows, cols, grid, bodies, scores, mults, digits, items,
-                 target_digit(digits), max(1, plies_left))
+                 target_digit(digits), max(1, plies_left), 0, crashed)
 
 
 def step(state, player, direction):
@@ -346,16 +380,11 @@ def step(state, player, direction):
     r += dr
     c += dc
     if not (0 <= r < state.rows and 0 <= c < cols):
-        s.crashed = player
-        return s
+        return _crash(s, player)
     dest = r * cols + c
     cell = state.grid[dest]
-    if cell == SNAKE:
-        s.crashed = player
-        return s
-    if cell == WALL:
-        s.scores[player] -= PENALTY
-        return s
+    if cell == SNAKE or cell == WALL:
+        return _crash(s, player)
 
     s.scores[player] += MOVE_POINTS
     grow = False
@@ -379,15 +408,17 @@ def step(state, player, direction):
             rest = tuple(c for c in state.digits.get(digit, ()) if c != dest)
             if rest:
                 s.digits[digit] = rest
-    elif cell == MULTIPLIER or cell == STAR:
+            _check_lost(s, player)
+    elif dest in state.items:
         s.items = dict(state.items)
         s.items.pop(dest, None)
         if cell == MULTIPLIER:
             s.scores[player] += MULTIPLIER_POINTS
             s.mults[player] += 1
-        else:
+        elif cell == STAR or cell == TAIL_FOOD[player]:
             s.scores[player] += FOOD_POINTS * state.mults[player]
             grow = True
+        # La cola que solto uno mismo solo se borra: sin puntos y sin crecer.
 
     grid = s.grid
     if grow:
@@ -399,8 +430,41 @@ def step(state, player, direction):
     return s
 
 
+def _check_lost(state, player):
+    if state.scores[player] < LOSING_SCORE and state.lost is None:
+        state.lost = player
+
+
+def crash_penalty(score, has_crashed):
+    """Puntaje despues de chocar: el primer choque lo deja en 0 si era positivo."""
+    if not has_crashed and score > 0:
+        return 0
+    return score - PENALTY
+
+
+def _crash(s, player):
+    """Choque (v7): no se mueve, se queda con cabeza + 2 y suelta el resto."""
+    s.scores[player] = crash_penalty(s.scores[player], s.has_crashed[player])
+    s.has_crashed[player] = True
+    body = s.bodies[player]
+    shed = body[:-KEPT_AFTER_CRASH]
+    if shed:
+        food = TAIL_FOOD[1 - player]
+        s.items = dict(s.items)
+        for cell in shed:
+            s.grid[cell] = food
+            s.items[cell] = food
+        s.bodies[player] = body[-KEPT_AFTER_CRASH:]
+    _check_lost(s, player)
+    return s
+
+
 def legal_moves(state, player):
-    """Las jugadas que no chocan. Pegarle al muro `#` cuenta: no mata."""
+    """Las jugadas que no chocan; si no queda ninguna, una que choca.
+
+    Chocar da lo mismo contra que (borde, cuerpo o muro): la vibora se queda
+    quieta. Por eso alcanza con una sola jugada que choque.
+    """
     body = state.bodies[player]
     if not body:
         return [None]
@@ -410,9 +474,9 @@ def legal_moves(state, player):
     for name, (dr, dc) in DIRECTIONS.items():
         nr, nc = r + dr, c + dc
         if 0 <= nr < state.rows and 0 <= nc < cols \
-                and state.grid[nr * cols + nc] != SNAKE:
+                and state.grid[nr * cols + nc] not in (SNAKE, WALL):
             moves.append(name)
-    return moves
+    return moves or [DEFAULT_DIRECTION]
 
 
 def _manhattan(a, b, cols):
@@ -429,8 +493,9 @@ def _goal(state, player):
         if head is None:
             return copies[0]
         return min(copies, key=lambda c: _manhattan(head, c, state.cols))
-    for cell in state.items:
-        return cell
+    for cell, ch in state.items.items():
+        if ch not in TAIL_FOOD or ch == TAIL_FOOD[player]:
+            return cell
     return None
 
 
@@ -513,9 +578,19 @@ def distances(state, player, free=None):
     return dist, area
 
 
-def _trapped(area, length):
+def crash_cost(state, player):
+    """Lo que pierde `player` si choca ahora: puntaje y la cola que le sirve al otro."""
+    score = state.scores[player]
+    loss = score - crash_penalty(score, state.has_crashed[player])
+    shed = max(0, len(state.bodies[player]) - KEPT_AFTER_CRASH)
+    return loss + SHED_FOOD_SHARE * shed * FOOD_POINTS * state.mults[1 - player]
+
+
+def _trapped(state, player, area):
+    """Encerrado en menos lugar que el propio largo: tarde o temprano choca."""
+    length = len(state.bodies[player])
     if length and area < length:
-        return TRAPPED + TRAPPED_PER_CELL * (length - area)
+        return crash_cost(state, player) + TRAPPED + TRAPPED_PER_CELL * (length - area)
     return 0
 
 
@@ -613,6 +688,10 @@ def evaluate(state):
             continue
         if ch == MULTIPLIER:
             gains = (MULTIPLIER_POINTS + mult_value,) * 2
+        elif ch == TAIL_FOOD[0]:
+            gains = (FOOD_POINTS * state.mults[0], 0)   # el rival solo la borra
+        elif ch == TAIL_FOOD[1]:
+            gains = (0, FOOD_POINTS * state.mults[1])
         else:
             gains = (FOOD_POINTS * state.mults[0], FOOD_POINTS * state.mults[1])
         if share > 0:
@@ -627,8 +706,8 @@ def evaluate(state):
         elif b >= 0:
             theirs += 1
     value += TERRITORY_WEIGHT * (mine - theirs)
-    value -= _trapped(area0, len(state.bodies[0]))
-    value += _trapped(area1, len(state.bodies[1]))
+    value -= _trapped(state, 0, area0)
+    value += _trapped(state, 1, area1)
     return value
 
 
@@ -642,8 +721,8 @@ class _Searcher:
         self.nodes = 0
 
     def search(self, state, depth, alpha, beta, ply):
-        if state.crashed is not None:
-            return -WIN + ply if state.crashed == 0 else WIN - ply
+        if state.lost is not None:
+            return -WIN + ply if state.lost == 0 else WIN - ply
         if state.plies_left <= 0:
             return final_score(state)
         if depth <= 0:
@@ -654,10 +733,6 @@ class _Searcher:
 
         player = state.to_move
         moves = legal_moves(state, player)
-        if not moves:
-            # No queda otra que chocar.
-            return -WIN + ply + 1 if player == 0 else WIN - ply - 1
-
         if player == 0:
             best = -INF
             for _, child in _children(state, 0, moves):
@@ -678,7 +753,7 @@ class _Searcher:
 def best_direction(state, time_budget=TIME_BUDGET, max_depth=MAX_DEPTH):
     """Mejor jugada para el jugador 0 dentro del presupuesto de tiempo."""
     moves = legal_moves(state, 0)
-    if not moves or moves == [None]:
+    if moves == [None]:
         return DEFAULT_DIRECTION
     ordered = _children(state, 0, moves)
     best = ordered[0][0]
@@ -711,6 +786,39 @@ def best_direction(state, time_budget=TIME_BUDGET, max_depth=MAX_DEPTH):
     return best
 
 
+# game_id -> lo que se vio en el turno anterior: cabezas, puntajes y quien ya
+# choco. Hace falta porque el server no avisa de los choques.
+_GAMES = {}
+
+
+def _remember(turn_data, state):
+    """Actualiza la memoria de la partida y devuelve quien ya choco."""
+    game_id = turn_data.get('game_id')
+    if not game_id:
+        return state.has_crashed
+    seen = _GAMES.get(game_id)
+    crashed = list(state.has_crashed)
+    if seen:
+        for p in (0, 1):
+            # Entre dos turnos cada uno movio una vez. Si la cabeza sigue en el
+            # mismo lugar y el puntaje bajo, choco.
+            if seen['heads'][p] is not None and seen['heads'][p] == state.head(p) \
+                    and state.scores[p] < seen['scores'][p]:
+                crashed[p] = True
+            crashed[p] = crashed[p] or seen['crashed'][p]
+    _GAMES[game_id] = {
+        'heads': (state.head(0), state.head(1)),
+        'scores': tuple(state.scores),
+        'crashed': tuple(crashed),
+    }
+    return crashed
+
+
+def forget_game(game_id):
+    """Libera la memoria de una partida terminada."""
+    _GAMES.pop(game_id, None)
+
+
 def choose_direction(turn_data, time_budget=TIME_BUDGET, max_depth=MAX_DEPTH):
     """Punto de entrada: `turn_data` de un `your_turn` -> direccion."""
     try:
@@ -719,4 +827,5 @@ def choose_direction(turn_data, time_budget=TIME_BUDGET, max_depth=MAX_DEPTH):
         state = None
     if state is None:
         return DEFAULT_DIRECTION
+    state.has_crashed = _remember(turn_data, state)
     return best_direction(state, time_budget, max_depth)
