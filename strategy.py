@@ -1,4 +1,4 @@
-"""Motor de juego para Snake (reglas v7 de CodeChallenge, 7 Oct 2026).
+"""Motor de juego para Snake (reglas v8 de CodeChallenge, 14 Oct 2026).
 
 Dos viboras, una por jugador, que mueven por turnos. El server manda el tablero
 como string (filas envueltas en `|...|` y unidas por saltos de linea) y espera
@@ -24,9 +24,16 @@ Lo que hay en el tablero y lo que vale:
   esa (el server repone otra en algun lado).
 - `X`: +50 y el multiplicador propio sube un escalon para siempre. No crece.
 - `#`: muro que se achica cada ronda. Pegarle es un choque.
+- Bombas de proximidad (v8): dos grandes (U+1F4A3) y cinco chicas (U+1F9E8).
+  Explotan cuando una cabeza termina su jugada a 2 celdas o menos de una
+  grande, o a 1 de una chica, contando la diagonal como una celda (un cuadrado
+  de 5x5 o de 3x3). Explotar deja el puntaje en 0 (si ya era 0 o menos, -500);
+  no es un choque: la jugada se hace igual. La bomba desaparece y aparece otra.
+  Nunca hay nada para comer en la zona de una bomba, y despues de la ronda 150
+  (con 100 jugadas por delante) ya no hay bombas.
 - Cada movimiento que no choca suma +1. Gana el que tiene mas puntos cuando se
   acaban los `remaining_moves` (cuentan las jugadas de los dos; desde la v7 son
-  400).
+  400). Desde la v8 el tablero tiene de 20 a 30 celdas por lado.
 - `*` es la comida de las reglas viejas (+100); se sigue entendiendo por las
   dudas.
 
@@ -71,6 +78,8 @@ SNAKE = 's'
 # Comida de cola en la grilla normalizada: la puede comer el jugador 0 / el 1.
 TAIL_FOOD = ('tail0', 'tail1')
 TAIL_CHARS = {'\u24b6': 'A', '\u24b7': 'B'}   # A / B en un circulo: quien la come
+# Bomba -> alcance (distancia de Chebyshev a la que explota).
+BOMB_CHARS = {'\U0001f4a3': 2, '\U0001f9e8': 1}
 DIGITS = frozenset('123456789')
 EMPTY_CHARS = frozenset(' .')
 _BORDER_CHARS = frozenset('+-=')
@@ -83,6 +92,7 @@ PENALTY = 500
 DEFAULT_REMAINING_MOVES = 400
 KEPT_AFTER_CRASH = 3        # cabeza + 2: lo que queda despues de chocar
 LOSING_SCORE = -2500        # por debajo de esto la partida esta perdida
+BOMBS_UNTIL = 100           # con estas jugadas por delante ya no hay bombas
 
 # La busqueda se corta por reloj. Al presupuesto hay que descontarle la ida y
 # vuelta por el websocket: el server no espera para siempre.
@@ -102,6 +112,10 @@ TRAPPED = 300               # encerrado: ademas de lo que cuesta el choque
 TRAPPED_PER_CELL = 50
 SHED_FOOD_SHARE = 0.5       # cuanto de la cola que suelta un choque se come el rival
 RACE_SOFTNESS = 1.5         # cuanto pesa un paso de ventaja en la carrera por una X
+# Un punto ahora vale un poco mas que el mismo punto mas adelante en la
+# busqueda: si no, comer ya o dentro de diez jugadas da igual y el bot posterga.
+TEMPO = 0.02                # descuento por jugada
+TEMPO_CAP = 0.5
 
 
 class BoardError(ValueError):
@@ -113,7 +127,9 @@ def parse_board(board, cols=None):
 
     Solo se recortan los `|` de los costados: los espacios son celdas vacias.
     """
-    text = (board or '').replace('\r', '')
+    # El selector de variante (U+FE0F) que a veces acompana a un emoji no es
+    # una celda.
+    text = (board or '').replace('\r', '').replace('\ufe0f', '')
     lines = text.split('\n')
     if len(lines) == 1 and '||' in text:
         lines = text.split('||')
@@ -240,17 +256,19 @@ class State:
     comida de cola. `digits` e `items` se comparten entre estados y solo se
     copian cuando alguien come. `has_crashed` dice si cada uno ya choco alguna
     vez (el primer choque es el que borra el puntaje) y `lost` quien bajo de
-    -2500, si alguno.
+    -2500, si alguno. `bombs` son pares (celda, alcance) y `zone` las celdas
+    donde una cabeza las haria explotar. En la grilla las bombas son celdas
+    vacias: lo que importa es su zona.
     """
 
     __slots__ = ('rows', 'cols', 'grid', 'bodies', 'scores', 'mults',
                  'digits', 'items', 'target', 'plies_left', 'to_move',
-                 'has_crashed', 'lost')
+                 'has_crashed', 'lost', 'bombs', 'zone', 'ply', 'tempo')
 
     def __init__(self, rows, cols, grid, bodies, scores=(0, 0), mults=(1, 1),
                  digits=None, items=None, target=None,
                  plies_left=DEFAULT_REMAINING_MOVES, to_move=0,
-                 has_crashed=(False, False)):
+                 has_crashed=(False, False), bombs=()):
         self.rows = rows
         self.cols = cols
         self.grid = list(grid)
@@ -264,6 +282,10 @@ class State:
         self.to_move = to_move
         self.has_crashed = list(has_crashed)
         self.lost = None
+        self.bombs = tuple(bombs)
+        self.zone = blast_zone(self.bombs, rows, cols)
+        self.ply = 0        # jugadas simuladas desde la posicion real
+        self.tempo = 0.0    # ajuste por cuando se ganaron los puntos (para el 0)
 
     def copy(self):
         s = State.__new__(State)
@@ -280,11 +302,30 @@ class State:
         s.to_move = self.to_move
         s.has_crashed = self.has_crashed[:]
         s.lost = self.lost
+        s.bombs = self.bombs
+        s.zone = self.zone
+        s.ply = self.ply
+        s.tempo = self.tempo
         return s
 
     def head(self, player):
         body = self.bodies[player]
         return body[-1] if body else None
+
+    def live_zone(self):
+        """La zona de las bombas, si todavia hay bombas en esta jugada."""
+        return self.zone if self.plies_left > BOMBS_UNTIL else frozenset()
+
+
+def blast_zone(bombs, rows, cols):
+    """Celdas donde terminar una jugada hace explotar alguna bomba."""
+    zone = set()
+    for cell, reach in bombs:
+        r, c = divmod(cell, cols)
+        for rr in range(max(0, r - reach), min(rows, r + reach + 1)):
+            for cc in range(max(0, c - reach), min(cols, c + reach + 1)):
+                zone.add(rr * cols + cc)
+    return frozenset(zone)
 
 
 def build_state(turn_data, has_crashed=(False, False)):
@@ -309,6 +350,7 @@ def build_state(turn_data, has_crashed=(False, False)):
     body_cells = {'A': set(), 'B': set()}
     digits = {}
     items = {}
+    bombs = []
     for r, line in enumerate(rows_text):
         for c, ch in enumerate(line):
             i = r * cols + c
@@ -328,6 +370,9 @@ def build_state(turn_data, has_crashed=(False, False)):
                 food = TAIL_FOOD[sides.index(TAIL_CHARS[ch])]
                 items[i] = food
                 grid.append(food)
+            elif ch in BOMB_CHARS:
+                bombs.append((i, BOMB_CHARS[ch]))
+                grid.append(EMPTY)
             elif ch in EMPTY_CHARS:
                 grid.append(EMPTY)
             else:
@@ -357,7 +402,7 @@ def build_state(turn_data, has_crashed=(False, False)):
 
     digits = {d: tuple(cells) for d, cells in digits.items()}
     return State(rows, cols, grid, bodies, scores, mults, digits, items,
-                 target_digit(digits), max(1, plies_left), 0, crashed)
+                 target_digit(digits), max(1, plies_left), 0, crashed, bombs)
 
 
 def step(state, player, direction):
@@ -367,12 +412,23 @@ def step(state, player, direction):
     Moverse sobre la propia cola se toma como choque: no sabemos si el server
     la corre antes o despues de mirar la colision, y mejor no averiguarlo.
     """
+    s = _apply(state, player, direction)
+    s.ply = state.ply + 1
+    delta = s.scores[player] - state.scores[player]
+    if delta and state.ply:
+        late = delta * min(TEMPO * state.ply, TEMPO_CAP)
+        s.tempo = state.tempo - late if player == 0 else state.tempo + late
+    return s
+
+
+def _apply(state, player, direction):
     s = state.copy()
     s.plies_left -= 1
     s.to_move = 1 - player
     body = state.bodies[player]
     if direction is None or not body:
         return s
+    zone = state.live_zone()
 
     cols = state.cols
     r, c = divmod(body[-1], cols)
@@ -380,11 +436,11 @@ def step(state, player, direction):
     r += dr
     c += dc
     if not (0 <= r < state.rows and 0 <= c < cols):
-        return _crash(s, player)
+        return _crash(s, player, zone)
     dest = r * cols + c
     cell = state.grid[dest]
     if cell == SNAKE or cell == WALL:
-        return _crash(s, player)
+        return _crash(s, player, zone)
 
     s.scores[player] += MOVE_POINTS
     grow = False
@@ -427,6 +483,8 @@ def step(state, player, direction):
         grid[body[0]] = EMPTY
         s.bodies[player] = body[1:] + (dest,)
     grid[dest] = SNAKE
+    if dest in zone:
+        _explode(s, player, dest, state.scores[player])
     return s
 
 
@@ -442,8 +500,11 @@ def crash_penalty(score, has_crashed):
     return score - PENALTY
 
 
-def _crash(s, player):
-    """Choque (v7): no se mueve, se queda con cabeza + 2 y suelta el resto."""
+def _crash(s, player, zone=frozenset()):
+    """Choque (v7): no se mueve, se queda con cabeza + 2 y suelta el resto.
+
+    La cola que caeria en la zona de una bomba no queda como comida: se borra.
+    """
     s.scores[player] = crash_penalty(s.scores[player], s.has_crashed[player])
     s.has_crashed[player] = True
     body = s.bodies[player]
@@ -452,11 +513,35 @@ def _crash(s, player):
         food = TAIL_FOOD[1 - player]
         s.items = dict(s.items)
         for cell in shed:
-            s.grid[cell] = food
-            s.items[cell] = food
+            if cell in zone:
+                s.grid[cell] = EMPTY
+            else:
+                s.grid[cell] = food
+                s.items[cell] = food
         s.bodies[player] = body[-KEPT_AFTER_CRASH:]
     _check_lost(s, player)
     return s
+
+
+def _explode(s, player, cell, score_before):
+    """Explosion (v8): el puntaje queda en 0 (o -500 si no era positivo).
+
+    No es un choque: la jugada ya se hizo y la cola sigue. Las bombas que
+    explotaron desaparecen; la que el server pone en su lugar no se sabe
+    donde va a estar.
+    """
+    if score_before > 0:
+        s.scores[player] = 0
+    else:
+        s.scores[player] -= PENALTY
+    cols = s.cols
+    r, c = divmod(cell, cols)
+    s.bombs = tuple(
+        (bomb, reach) for bomb, reach in s.bombs
+        if max(abs(bomb // cols - r), abs(bomb % cols - c)) > reach
+    )
+    s.zone = blast_zone(s.bombs, s.rows, cols)
+    _check_lost(s, player)
 
 
 def legal_moves(state, player):
@@ -530,7 +615,8 @@ def distances(state, player, free=None):
 
     Los cuerpos cuentan como libres cuando su segmento ya se habria corrido,
     siempre que haya lugar para dar vueltas mientras tanto. Los digitos se
-    alcanzan pero no se atraviesan (comer el equivocado cuesta 500).
+    alcanzan pero no se atraviesan (comer el equivocado cuesta 500), y la zona
+    de las bombas no se pisa (explotar borra el puntaje).
     """
     if free is None:
         free = _free_times(state)
@@ -540,6 +626,7 @@ def distances(state, player, free=None):
     if not body:
         return dist, 0
     grid = state.grid
+    zone = state.live_zone()
     neigh = neighbors(state.rows, state.cols)
     start = body[-1]
     dist[start] = 0
@@ -556,7 +643,7 @@ def distances(state, player, free=None):
                 if dist[j] >= 0:
                     continue
                 ch = grid[j]
-                if ch == WALL:
+                if ch == WALL or j in zone:
                     continue
                 if ch == SNAKE:
                     ready = free.get(j, INF)
@@ -661,10 +748,10 @@ def _race_share(a, b, my_turn):
 def final_score(state):
     diff = state.scores[0] - state.scores[1]
     if diff > 0:
-        return WIN + diff
+        return WIN + diff + state.tempo
     if diff < 0:
-        return -WIN + diff
-    return 0
+        return -WIN + diff + state.tempo
+    return state.tempo
 
 
 def evaluate(state):
@@ -675,7 +762,7 @@ def evaluate(state):
     d1, area1 = dist[1]
     my_turn = state.to_move == 0
 
-    value = state.scores[0] - state.scores[1]
+    value = state.scores[0] - state.scores[1] + state.tempo
     mult_value = MULT_VALUE_PER_MOVE * state.plies_left / 2
     value += (state.mults[0] - state.mults[1]) * mult_value
 

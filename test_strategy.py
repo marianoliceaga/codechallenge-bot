@@ -11,6 +11,8 @@ FAST = 0.3
 
 TAIL_A = '\u24b6'   # comida de cola que solo come A
 TAIL_B = '\u24b7'   # comida de cola que solo come B
+BIG = '\U0001f4a3'    # bomba grande: explota a 2 celdas
+SMALL = '\U0001f9e8'  # bomba chica: explota a 1 celda
 
 
 def board(*rows):
@@ -56,6 +58,9 @@ class TestParseBoard(unittest.TestCase):
 
     def test_rows_glued_with_pipes_on_one_line(self):
         self.assertEqual(strategy.parse_board('|A || 1|'), ['A ', ' 1'])
+
+    def test_emoji_variation_selectors_are_not_cells(self):
+        self.assertEqual(strategy.parse_board('|A' + BIG + '\ufe0f |'), ['A' + BIG + ' '])
 
     def test_carriage_returns_are_ignored(self):
         self.assertEqual(strategy.parse_board('|A |\r\n| 1|\r\n'), ['A ', ' 1'])
@@ -193,6 +198,18 @@ class TestBuildState(unittest.TestCase):
 
         self.assertEqual(s.has_crashed, [True, False])
 
+    def test_bombs_are_read_with_their_reach(self):
+        s = state(['aA   ' + BIG, '      ', '   ' + SMALL + '  ', '      ', '     B'])
+
+        self.assertEqual(s.bombs, ((5, 2), (15, 1)))
+        self.assertEqual(s.grid[5], strategy.EMPTY)
+        # 5x5 recortado por el borde alrededor de la grande, 3x3 de la chica.
+        self.assertIn(3, s.zone)
+        self.assertIn(17, s.zone)
+        self.assertIn(8, s.zone)
+        self.assertNotIn(2, s.zone)
+        self.assertNotIn(1, s.zone)
+
     def test_the_opponent_may_be_missing(self):
         self.assertEqual(state(['A ', '  ']).bodies[1], ())
 
@@ -304,6 +321,54 @@ class TestStep(unittest.TestCase):
         t = strategy.step(state(['aA2  ', '  1  ', '    B'], score_1=-2100), 0, 'right')
         self.assertEqual(t.lost, 0)
 
+    def test_a_shed_tail_inside_a_blast_zone_vanishes(self):
+        # La chica en (1, 2) alcanza (0, 1) y (0, 2): esa parte de la cola se borra.
+        s = state(['aaaaaA#', '  ' + SMALL + '    ', '      B'], score_1=50)
+
+        t = strategy.step(s, 0, 'right')
+
+        self.assertEqual(t.grid[1], strategy.EMPTY)
+        self.assertEqual(t.grid[2], strategy.EMPTY)
+        self.assertEqual(t.grid[0], 'tail1')
+        self.assertEqual(t.items, {0: 'tail1'})
+
+    def test_entering_a_blast_zone_wipes_the_score(self):
+        s = state(['aA    ', '      ', '    ' + BIG + ' ', '     B'], score_1=900)
+
+        t = strategy.step(s, 0, 'right')     # a 2 celdas de la grande
+
+        self.assertEqual(t.scores[0], 0)
+        self.assertEqual(t.bodies[0], (1, 2))    # la jugada se hizo igual
+        self.assertFalse(t.has_crashed[0])       # no es un choque
+        self.assertEqual(t.bombs, ())
+        self.assertEqual(t.zone, frozenset())
+
+    def test_an_explosion_with_no_points_costs_500(self):
+        s = state(['aA    ', '      ', '    ' + BIG + ' ', '     B'])
+
+        self.assertEqual(strategy.step(s, 0, 'right').scores[0], 1 - 500)
+
+    def test_two_bombs_in_reach_count_once(self):
+        s = state(['aA ' + SMALL + '  ', '   ' + SMALL + '  ', '     B'], score_1=-100)
+
+        t = strategy.step(s, 0, 'right')
+
+        self.assertEqual(t.scores[0], -100 + 1 - 500)
+        self.assertEqual(t.bombs, ())
+
+    def test_bombs_are_gone_in_the_last_100_moves(self):
+        s = state(['aA    ', '      ', '    ' + BIG + ' ', '     B'],
+                  score_1=900, remaining=100)
+
+        t = strategy.step(s, 0, 'right')
+
+        self.assertEqual(t.scores[0], 901)
+
+    def test_the_opponent_sets_bombs_off_too(self):
+        s = state(['aA  ' + BIG + ' ', '      ', '      ', '  Bbb '], score_2=700)
+
+        self.assertEqual(strategy.step(s, 1, 'up').scores[1], 0)
+
     def test_tail_food_feeds_only_its_owner(self):
         s = state(['aA' + TAIL_A + '  ', '    B'], mult_1=3)
 
@@ -403,6 +468,18 @@ class TestDistances(unittest.TestCase):
         self.assertGreater(area, 0)
         self.assertGreater(dist[5 + 4], 0)
 
+    def test_blast_zones_are_not_walked_through(self):
+        s = state(['A  ' + SMALL + '   ', '       ', '      B'])
+
+        dist, _ = strategy.distances(s, 0)
+
+        self.assertEqual(dist[2], -1)
+        self.assertEqual(dist[9], -1)
+        self.assertGreater(dist[5], 5)   # rodea por abajo
+
+        late = state(['A  ' + SMALL + '   ', '       ', '      B'], remaining=100)
+        self.assertEqual(strategy.distances(late, 0)[0][2], 2)
+
     def test_a_missing_snake_reaches_nothing(self):
         dist, area = strategy.distances(state(['A ', '  ']), 1)
 
@@ -454,6 +531,16 @@ class TestEvaluate(unittest.TestCase):
         self.assertLess(share(3, 3, False), 0.5)
         self.assertGreater(share(2, 8, False), 0.95)
         self.assertLess(share(3, 4, False), share(3, 5, False))
+
+    def test_points_later_in_the_search_count_a_little_less(self):
+        s = state(['aA1 1', '     ', '    B'])
+
+        now = strategy.step(s, 0, 'right')
+        self.assertEqual(now.tempo, 0)
+
+        later = strategy.step(strategy.step(s, 1, 'up'), 0, 'right')
+        self.assertLess(later.tempo, 0)
+        self.assertEqual(later.ply, 2)
 
     def test_final_score_is_a_win_a_loss_or_a_draw(self):
         s = state(['A ', ' B'])
@@ -616,6 +703,18 @@ class TestChooseDirection(unittest.TestCase):
         ]
 
         self.assertIn(choose(rows), strategy.DIRECTIONS)
+
+    def test_keeps_its_score_out_of_a_blast_zone(self):
+        # El 1 esta derecho, pero seguir derecho entra en la zona de la chica.
+        rows = [
+            '          ',
+            ' aaA ' + SMALL + '  1 ',
+            '          ',
+            ' 2  3  4  ',
+            '5        B',
+        ]
+
+        self.assertNotEqual(choose(rows, score_1=3000), 'right')
 
     def test_when_every_move_crashes_it_still_answers(self):
         rows = [
